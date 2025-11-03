@@ -11,7 +11,7 @@ train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
 python3 -m verl.trainer.main_ppo --config-path=config \
-    --config-name='ppo_megatron_trainer.yaml'\
+    --config-name='ppo_megatron_trainer.yaml' \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
