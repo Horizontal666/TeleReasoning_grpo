@@ -19,6 +19,8 @@ DEFAULT_DATASET="${PROJECT_ROOT}/data/TeleLogs/troubleshooting/test.json"
 
 DEFAULT_API_BASE="${VLLM_API_BASE:-http://127.0.0.1:6005/v1}"
 DEFAULT_API_KEY="${OPENAI_API_KEY:-EMPTY}"
+DEFAULT_ATTEMPTS="${EVAL_ATTEMPTS:-3}"
+
 
 
 # Allow overriding defaults via positional args.
@@ -28,6 +30,7 @@ DATASET="${DEFAULT_DATASET}"
 GPU_SELECTION=""
 API_BASE="${DEFAULT_API_BASE}"
 API_KEY="${DEFAULT_API_KEY}"
+ATTEMPTS="${DEFAULT_ATTEMPTS}"
 
 if [[ $# -gt 0 ]]; then
     MODEL="$1"
@@ -94,6 +97,7 @@ fi
 
 append_flag_if_missing "--api-base" "${API_BASE}"
 append_flag_if_missing "--api-key" "${API_KEY}"
+append_flag_if_missing "--max-attempts" "${ATTEMPTS}"
 
 # Forward remaining CLI options directly into the evaluator.
 set -x
