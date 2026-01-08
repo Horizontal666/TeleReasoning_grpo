@@ -4,7 +4,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import (
@@ -19,7 +19,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     OpenAI = None
 
-from utils.evals import EvalItem, load_eval_spec, summarize
+from utils.evals import EvalItem, load_eval_spec, summarize, run_inference_attempts
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling value.")
     parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty for generation.")
     parser.add_argument("--log-samples", type=int, default=10, help="Print interim metrics every N samples.")
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=1,
+        help="Maximum inference attempts per sample; stop once an attempt is correct.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders.")
     return parser.parse_args()
 
@@ -218,52 +224,60 @@ def main() -> None:
         model.eval()
         gen_kwargs = build_generation_kwargs(args)
 
+    attempt_limit = max(1, int(args.max_attempts or 1))
+
     results: List[Dict[str, object]] = []
     for idx, item in enumerate(items):
         prompt = item.prompt
-        t0 = time.time()
 
         if using_remote:
-            text = chat_complete_remote(client, args, prompt)
-            latency = time.time() - t0
+            def _attempt(_: EvalItem) -> Tuple[str, float]:
+                t0 = time.time()
+                text = chat_complete_remote(client, args, prompt)
+                return text, time.time() - t0
+
         else:
             assert tokenizer is not None and config is not None and model is not None
-            encoded = tokenizer(prompt, return_tensors="pt")
             if using_device_map:
                 fallback = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 target_device = resolve_generation_device(model, fallback)
             else:
                 target_device = device
-            encoded = {k: v.to(target_device) for k, v in encoded.items()}
+            target_device_local = target_device
 
-            with torch.inference_mode():
-                output_ids = model.generate(**encoded, **gen_kwargs)
-            latency = time.time() - t0
+            def _attempt(_: EvalItem) -> Tuple[str, float]:
+                encoded = tokenizer(prompt, return_tensors="pt")
+                encoded_local = {k: v.to(target_device_local) for k, v in encoded.items()}
+                t0 = time.time()
+                with torch.inference_mode():
+                    output_ids = model.generate(**encoded_local, **gen_kwargs)
+                latency = time.time() - t0
+                generated = output_ids[0]
+                if not getattr(config, "is_encoder_decoder", False):
+                    input_len = encoded_local["input_ids"].shape[-1]
+                    generated = generated[input_len:]
+                text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+                return text, latency
 
-            generated = output_ids[0]
-            if not getattr(config, "is_encoder_decoder", False):
-                input_len = encoded["input_ids"].shape[-1]
-                generated = generated[input_len:]
-            text = tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-        pred_value = spec.parse_prediction(text, item)
+        outcome = run_inference_attempts(item, _attempt, spec, attempt_limit)
         label_str = spec.format_label(item)
-        pred_str = spec.format_pred(pred_value, item)
-        correct = spec.is_correct(item, pred_value)
 
         result = {
             "id": item.id,
             "label": label_str,
-            "pred": pred_str,
-            "correct": bool(correct),
+            "pred": outcome.chosen_formatted_pred or "",
+            "correct": bool(outcome.correct),
             "prompt": prompt,
-            "response_text": text,
-            "latency": latency,
+            "response_text": outcome.response_text,
+            "latency": outcome.latency,
             "dataset": spec.name,
+            "attempts": outcome.attempts,
+            "attempt_limit": attempt_limit,
+            "chosen_attempt_index": outcome.chosen_attempt_index,
         }
         if item.metadata:
             result["metadata"] = item.metadata
-        extras = spec.extras(item, pred_value)
+        extras = spec.extras(item, outcome.chosen_pred_value)
         if extras:
             for key, value in extras.items():
                 if value is not None:
