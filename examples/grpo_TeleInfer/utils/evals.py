@@ -6,7 +6,7 @@ import re
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 WORKING_GROUP_KEY = "WORKING GROUP"
 NUMBER_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
@@ -21,6 +21,17 @@ class EvalItem:
     prompt: str
     label: Any
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AttemptOutcome:
+    attempts: List[Dict[str, Any]]
+    chosen_pred_value: Any
+    chosen_formatted_pred: Optional[str]
+    response_text: str
+    latency: Optional[float]
+    correct: bool
+    chosen_attempt_index: Optional[int]
 
 
 def _default_extras(item: EvalItem, pred: Any) -> Dict[str, Any]:
@@ -196,6 +207,73 @@ def last_non_empty_line(text: str) -> Optional[str]:
 
 def normalize_expression(expr: str) -> str:
     return re.sub(r"\s+", "", expr)
+
+
+def run_inference_attempts(
+    item: EvalItem,
+    infer_fn: Callable[[EvalItem], Tuple[str, float]],
+    spec: EvalSpec,
+    attempts: int,
+) -> AttemptOutcome:
+    max_attempts = max(1, int(attempts or 1))
+    attempt_logs: List[Dict[str, Any]] = []
+    chosen_pred_value: Any = None
+    chosen_formatted_pred: Optional[str] = None
+    response_text = ""
+    latency_value: Optional[float] = None
+    correct = False
+    chosen_attempt_index: Optional[int] = None
+    last_pred_value: Any = None
+    last_formatted_pred: Optional[str] = None
+    last_text = ""
+    last_latency: Optional[float] = None
+
+    for attempt_idx in range(max_attempts):
+        text, latency = infer_fn(item)
+        pred_value = spec.parse_prediction(text, item)
+        formatted_pred = spec.format_pred(pred_value, item)
+        attempt_correct = spec.is_correct(item, pred_value)
+
+        attempt_logs.append(
+            {
+                "index": attempt_idx + 1,
+                "response_text": text,
+                "latency": latency,
+                "pred": formatted_pred,
+                "correct": bool(attempt_correct),
+            }
+        )
+
+        last_pred_value = pred_value
+        last_formatted_pred = formatted_pred
+        last_text = text
+        last_latency = latency
+
+        if attempt_correct:
+            correct = True
+            chosen_pred_value = pred_value
+            chosen_formatted_pred = formatted_pred
+            response_text = text
+            latency_value = latency
+            chosen_attempt_index = attempt_idx
+            break
+
+    if chosen_pred_value is None:
+        chosen_pred_value = last_pred_value
+        chosen_formatted_pred = last_formatted_pred
+        response_text = last_text or ""
+        latency_value = last_latency
+        chosen_attempt_index = len(attempt_logs) - 1 if attempt_logs else None
+
+    return AttemptOutcome(
+        attempts=attempt_logs,
+        chosen_pred_value=chosen_pred_value,
+        chosen_formatted_pred=chosen_formatted_pred,
+        response_text=response_text or "",
+        latency=latency_value,
+        correct=correct,
+        chosen_attempt_index=chosen_attempt_index,
+    )
 
 
 def extract_troubleshooting_codes(text: str, valid_codes: Sequence[str]) -> List[str]:
