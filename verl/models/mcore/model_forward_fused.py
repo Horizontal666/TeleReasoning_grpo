@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.utils import deprecate_inference_params
+from packaging import version
 from torch import Tensor
 
 from verl.models.mcore.util import preprocess_packed_seqs
@@ -49,7 +50,9 @@ def _get_patching_model(model: torch.nn.Module):
 
 
 def patch_fused_forward(model: torch.nn.Module):
-    assert mcore.__version__ >= "0.13.0", "Fused forward patching requires mecore >= 0.13.0"
+    assert version.parse(mcore.__version__) >= version.parse("0.13.0"), (
+        "Fused forward patching requires mecore >= 0.13.0"
+    )
     model = _get_patching_model(model)
     if model is not None:
         model.forward_backup = model.forward
@@ -74,8 +77,8 @@ def fused_forward_model_gen(vision_model: bool = False):
         multi_modal_inputs: dict,
     ):
         pre_process: bool = (
-            unwrap_model(model).pre_process if not vision_model else True
-        )  # vision model always needs pre_process
+            unwrap_model(model).pre_process if not vision_model else False
+        )  # vision model does not need pre_process, because we pack the input_ids to thd in the forward function
         post_process: bool = unwrap_model(model).post_process
 
         model_kwargs = {}
@@ -83,6 +86,10 @@ def fused_forward_model_gen(vision_model: bool = False):
             model_kwargs["pixel_values"] = multi_modal_inputs["pixel_values"].to(input_ids.device)
         if "image_grid_thw" in multi_modal_inputs:
             model_kwargs["image_grid_thw"] = multi_modal_inputs["image_grid_thw"].to(input_ids.device)
+        if "pixel_values_videos" in multi_modal_inputs:
+            model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
+        if "video_grid_thw" in multi_modal_inputs:
+            model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
 
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
@@ -92,15 +99,25 @@ def fused_forward_model_gen(vision_model: bool = False):
         labels_rmpad = labels_rmpad.contiguous()
         labels_mask_rmpad = labels_mask_rmpad.contiguous()
 
-        output_orig: CausalLMOutputForPPO = model(
+        input_args = dict(
             input_ids=input_ids_rmpad,
             attention_mask=None,
             position_ids=position_ids if not vision_model else None,  # vision models will calculate position_ids
-            labels=labels_rmpad,
             packed_seq_params=packed_seq_params,
+            labels=labels_rmpad,
             temperature=temperature,
             **model_kwargs,
         )
+
+        if vision_model:
+            # workaround for supporting sequence packing with context parallelism
+            # cp split with sequence packing will make model lose vision token information, so we need to keep
+            # the original input_ids and pack them after vision embedding is calculated,
+            # cooporate with mbridge
+            input_args["input_ids"] = input_ids
+            input_args["attention_mask"] = attention_mask
+
+        output_orig: CausalLMOutputForPPO = model(**input_args)
 
         if post_process:
             # output_orig is in type of CausalLMOutputForPPO
@@ -184,9 +201,17 @@ def _fused_GPTModel_forward(
 
     if model.config.sequence_parallel:
         hidden_states = gather_from_sequence_parallel_region(hidden_states)
+
+    # Get the output weight - use embedding weight if output_layer is None or weight is shared
+    if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
+        output_weight = model.output_layer.weight
+    else:
+        # When embeddings are tied, use the embedding weight
+        output_weight = model.embedding.word_embeddings.weight
+
     logprobs, entropy = linear_cross_entropy(
         hidden_states,
-        model.output_layer.weight,
+        output_weight,
         labels,
         temperature,
         "none",
