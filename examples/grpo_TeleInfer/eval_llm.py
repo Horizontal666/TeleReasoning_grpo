@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Maximum inference attempts per sample; stop once an attempt is correct.",
     )
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="Wrap prompts with the tokenizer chat template before local HF generation.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to HF loaders.")
     return parser.parse_args()
 
@@ -195,6 +200,17 @@ def resolve_generation_device(model: torch.nn.Module, fallback: torch.device) ->
     return fallback
 
 
+def encode_local_prompt(tokenizer, prompt: str, apply_chat_template: bool):
+    """Tokenize a prompt, optionally routing through the tokenizer chat template."""
+    if apply_chat_template:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return tokenizer(prompt, return_tensors="pt")
+
+
 def main() -> None:
     """Execute the full evaluation pipeline and emit metrics/predictions."""
     args = parse_args()
@@ -246,7 +262,7 @@ def main() -> None:
             target_device_local = target_device
 
             def _attempt(_: EvalItem) -> Tuple[str, float]:
-                encoded = tokenizer(prompt, return_tensors="pt")
+                encoded = encode_local_prompt(tokenizer, prompt, args.apply_chat_template)
                 encoded_local = {k: v.to(target_device_local) for k, v in encoded.items()}
                 t0 = time.time()
                 with torch.inference_mode():

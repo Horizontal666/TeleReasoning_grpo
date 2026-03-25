@@ -565,6 +565,17 @@ def process_validation_metrics(
     reduce_fns_best_worst = [np.max, np.min]
     n_bootstrap = 1000
 
+    def to_numeric_metric_array(var_vals: list[Any]) -> np.ndarray | None:
+        if not var_vals or any(v is None for v in var_vals):
+            return None
+        try:
+            arr = np.asarray(var_vals, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if arr.ndim != 1 or not np.all(np.isfinite(arr)):
+            return None
+        return arr
+
     # 2. cache ns list
     def gen_ns(n_resps: int) -> list[int]:
         if n_resps <= 1:
@@ -593,16 +604,16 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                numeric_var_vals = to_numeric_metric_array(var_vals)
+                if numeric_var_vals is None:
                     continue
 
                 # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                n_resps = len(numeric_var_vals)
+                metric = {f"mean@{n_resps}": float(np_mean(numeric_var_vals))}
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+                    metric[f"std@{n_resps}"] = float(np_std(numeric_var_vals))
 
                     # cache ns list
                     if n_resps not in ns_cache:
@@ -613,7 +624,7 @@ def process_validation_metrics(
                     for n in ns:
                         # compute best/worst metrics
                         (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
+                            data=numeric_var_vals,
                             subset_size=n,
                             reduce_fns=reduce_fns_best_worst,
                             n_bootstrap=n_bootstrap,
@@ -628,7 +639,8 @@ def process_validation_metrics(
                         if has_pred:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": float(val), "pred": pred}
+                                for val, pred in zip(numeric_var_vals, pred_vals, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

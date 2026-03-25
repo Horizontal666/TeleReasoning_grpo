@@ -2,10 +2,8 @@ set -x
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/gsm8k/train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/gsm8k/test.parquet \
-    # data.train_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
-    # data.val_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_test.parquet
+    data.train_files=/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/train.parquet \
+    data.val_files=/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/test.parquet \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \

@@ -67,6 +67,49 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _build_generation_dump_records(
+    inputs,
+    outputs,
+    gts,
+    scores,
+    step,
+    reward_extra_infos_dict=None,
+    extra_columns=None,
+):
+    """Build rollout/validation dump records with optional aligned extra columns."""
+
+    def _to_json_compatible(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return [_to_json_compatible(v) for v in value.tolist()]
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return _to_json_compatible(value.item())
+            return [_to_json_compatible(v) for v in value.detach().cpu().tolist()]
+        if isinstance(value, dict):
+            return {k: _to_json_compatible(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_to_json_compatible(v) for v in value]
+        return value
+
+    n = len(inputs)
+    base_data = {
+        "input": inputs,
+        "output": outputs,
+        "gts": gts,
+        "score": scores,
+        "step": [step] * n,
+    }
+
+    for columns in (reward_extra_infos_dict or {}, extra_columns or {}):
+        for key, values in columns.items():
+            if len(values) == n:
+                base_data[key] = list(values)
+
+    return [{key: _to_json_compatible(values[i]) for key, values in base_data.items()} for i in range(n)]
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -450,28 +493,21 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, extra_columns=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
-        n = len(inputs)
-        base_data = {
-            "input": inputs,
-            "output": outputs,
-            "gts": gts,
-            "score": scores,
-            "step": [self.global_steps] * n,
-        }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
-
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+        records = _build_generation_dump_records(
+            inputs=inputs,
+            outputs=outputs,
+            gts=gts,
+            scores=scores,
+            step=self.global_steps,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            extra_columns=extra_columns,
+        )
+        lines = [json.dumps(entry, ensure_ascii=False) for entry in records]
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -496,10 +532,14 @@ class RayPPOTrainer:
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+
+            extra_columns = {}
+            if "uid" in batch.non_tensor_batch:
+                extra_columns["uid"] = batch.non_tensor_batch["uid"].tolist()
 
             self._dump_generations(
                 inputs=inputs,
@@ -508,6 +548,7 @@ class RayPPOTrainer:
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                extra_columns=extra_columns,
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -718,6 +759,7 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                extra_columns={"uid": sample_uids},
             )
 
         for key_info, lst in reward_extra_infos_dict.items():

@@ -484,6 +484,23 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
 
+    def test_process_validation_metrics_skips_non_numeric_pred_with_none(self):
+        """Validation metric aggregation should ignore non-numeric aux fields such as pred=None."""
+        data_sources = ["source1", "source1", "source1"]
+        sample_inputs = ["prompt1", "prompt1", "prompt1"]
+        infos_dict = {
+            "score": [0.8, 0.9, 0.7],
+            "acc": [True, False, True],
+            "pred": [None, "B", "A"],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("score", result["source1"])
+        self.assertIn("acc", result["source1"])
+        self.assertNotIn("pred", result["source1"])
+        self.assertIn("maj@2/mean", result["source1"]["score"])
+
 
 if __name__ == "__main__":
     unittest.main()

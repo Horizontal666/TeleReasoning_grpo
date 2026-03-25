@@ -2,10 +2,10 @@ set -x
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
-gsm8k_train_path=$HOME/data/gsm8k/train.parquet
-gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+gsm8k_train_path=$HOME/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/train.parquet
+gsm8k_test_path=$HOME/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/test.parquet
+# math_train_path=$HOME/data/math/train.parquet
+# math_test_path=$HOME/data/math/test.parquet
 
 train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"

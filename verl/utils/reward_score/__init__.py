@@ -106,7 +106,7 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     # ==== 新增 TeleMath 分支 ====
-    elif data_source in ("local/TeleMath", "FineFineWeb-telecom-math", "TeleMath"):
+    elif data_source in ("local/TeleMath", "FineFineWeb-telecom-math", "TeleMath", "TeleMath_test", "TeleMath_expand_5_primaryTest"):
         from . import telemath
         res = telemath.compute_score(solution_str, ground_truth)
     # ==========================

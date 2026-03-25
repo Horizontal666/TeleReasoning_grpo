@@ -13,6 +13,8 @@ NUMBER_PATTERN = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 BOX_PATTERN = re.compile(r"\\boxed\s*\{([^{}]+)\}")
 CHOICE_PATTERN = re.compile(r"C\d+", flags=re.IGNORECASE)
 LETTER_PATTERN = re.compile(r"\b([A-Z])\b")
+GSM8K_STRICT_PATTERN = re.compile(r"#### (\-?[0-9\.\,]+)")
+GSM8K_CLIP_CHARS = 300
 
 
 @dataclass
@@ -54,8 +56,25 @@ def load_eval_spec(path: Path) -> EvalSpec:
     path = Path(path)
     if path.suffix.lower() == ".parquet":
         return _load_parquet_spec(path)
+    if path.suffix.lower() == ".jsonl":
+        return _load_jsonl_spec(path)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
+    return _load_json_payload_spec(payload)
+
+
+def _load_jsonl_spec(path: Path) -> EvalSpec:
+    records: List[Any] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return _load_json_payload_spec(records)
+
+
+def _load_json_payload_spec(payload: Any) -> EvalSpec:
     if isinstance(payload, list):
         if payload and isinstance(payload[0], dict):
             sample_keys = set(payload[0].keys())
@@ -63,12 +82,14 @@ def load_eval_spec(path: Path) -> EvalSpec:
                 return _build_3gpp_spec(payload)
             if {"question", "answer", "tags"} <= sample_keys:
                 return _build_telemath_spec(payload)
+            if _looks_like_gsm8k_records(payload):
+                return _build_gsm8k_json_spec(payload)
             if {"question", "answer"} <= sample_keys:
                 return _build_telelogs_troubleshooting_spec(payload)
         raise ValueError("Unsupported list-based dataset schema.")
     if isinstance(payload, dict):
         return _build_teleqna_spec(payload)
-    raise ValueError(f"Unsupported dataset format for {path}.")
+    raise ValueError("Unsupported dataset format.")
 
 
 # -------- Shared helpers --------
@@ -176,6 +197,26 @@ def extract_numeric_answer(text: str) -> Optional[float]:
             return float(token)
         except ValueError:
             continue
+    return None
+
+
+def extract_gsm8k_answer(text: str, method: str = "strict") -> Optional[str]:
+    if not isinstance(text, str):
+        return None
+    if method not in {"strict", "flexible"}:
+        raise ValueError(f"Unsupported GSM8K extraction method: {method}")
+
+    clipped = text[-GSM8K_CLIP_CHARS:] if len(text) > GSM8K_CLIP_CHARS else text
+    if method == "strict":
+        answers = GSM8K_STRICT_PATTERN.findall(clipped)
+        if not answers:
+            return None
+        return answers[-1].replace(",", "").replace("$", "")
+
+    answers = re.findall(r"(\-?[0-9\.\,]+)", clipped)
+    for answer in reversed(answers):
+        if answer not in {"", "."}:
+            return answer.replace(",", "").replace("$", "")
     return None
 
 
@@ -360,6 +401,10 @@ def _load_parquet_spec(path: Path) -> EvalSpec:
         raise
 
     columns = set(df.columns)
+    if "data_source" in columns:
+        data_sources = {str(value) for value in df["data_source"].dropna().unique().tolist()}
+        if data_sources == {"openai/gsm8k"}:
+            return _build_gsm8k_parquet_spec(path, df.to_dict("records"))
     if {"prompt", "reward_model"}.issubset(columns):
         return _build_wireless_mathbench_spec(path, df.to_dict("records"))
     if "correct_answer" in columns and "prompt" in columns:
@@ -615,6 +660,148 @@ def _build_telemath_spec(raw: List[Dict[str, Any]]) -> EvalSpec:
 
     return EvalSpec(
         name="telemath",
+        items=items,
+        parse_prediction=parse_prediction,
+        format_label=format_label,
+        format_pred=format_pred,
+        is_correct=is_correct,
+        per_class=False,
+        extras=extras,
+    )
+
+
+# -------- GSM8K numeric QA --------
+
+def _looks_like_gsm8k_records(raw: Sequence[Dict[str, Any]]) -> bool:
+    if not raw:
+        return False
+    sample = raw[0]
+    if not isinstance(sample, dict):
+        return False
+    if not {"question", "answer"}.issubset(sample.keys()):
+        return False
+    answer = sample.get("answer")
+    return isinstance(answer, str) and "####" in answer
+
+
+def _extract_prompt_text(raw_prompt: Any) -> str:
+    if not isinstance(raw_prompt, (str, bytes, dict)) and hasattr(raw_prompt, "__iter__"):
+        contents: List[str] = []
+        for msg in list(raw_prompt):
+            if not isinstance(msg, dict):
+                continue
+            content = str(msg.get("content", "")).strip()
+            if content:
+                contents.append(content)
+        if contents:
+            return "\n\n".join(contents)
+    return _render_chat_messages(raw_prompt)
+
+
+def _build_gsm8k_json_spec(raw: List[Dict[str, Any]]) -> EvalSpec:
+    items: List[EvalItem] = []
+    for idx, sample in enumerate(raw):
+        question = str(sample.get("question", "")).strip()
+        answer = str(sample.get("answer", "")).strip()
+        ground_truth = extract_gsm8k_answer(answer, method="strict")
+        items.append(
+            EvalItem(
+                id=str(sample.get("idx", idx)),
+                prompt=question,
+                label=ground_truth or "",
+                metadata={
+                    "dataset": "gsm8k",
+                    "ground_truth_raw": answer,
+                    "question": question,
+                },
+            )
+        )
+
+    def parse_prediction(text: str, _: EvalItem) -> Optional[str]:
+        return extract_gsm8k_answer(text, method="strict")
+
+    def format_label(item: EvalItem) -> str:
+        return f"#### {item.label}" if item.label else ""
+
+    def format_pred(pred: Optional[str], _: EvalItem) -> Optional[str]:
+        if pred is None:
+            return None
+        return f"#### {pred}"
+
+    def is_correct(item: EvalItem, pred: Optional[str]) -> bool:
+        return bool(item.label) and pred == item.label
+
+    def extras(item: EvalItem, pred: Optional[str]) -> Dict[str, Any]:
+        return {
+            "ground_truth_raw": item.metadata.get("ground_truth_raw"),
+            "pred_answer": pred,
+        }
+
+    return EvalSpec(
+        name="gsm8k",
+        items=items,
+        parse_prediction=parse_prediction,
+        format_label=format_label,
+        format_pred=format_pred,
+        is_correct=is_correct,
+        per_class=False,
+        extras=extras,
+    )
+
+
+def _build_gsm8k_parquet_spec(path: Path, records: Iterable[Dict[str, Any]]) -> EvalSpec:
+    items: List[EvalItem] = []
+    for idx, sample in enumerate(records):
+        prompt_text = _extract_prompt_text(sample.get("prompt"))
+        reward_model = sample.get("reward_model") or {}
+        extra_info = sample.get("extra_info") or {}
+        ground_truth = str(reward_model.get("ground_truth", "")).strip().replace(",", "").replace("$", "")
+        item_id = (
+            sample.get("id")
+            or extra_info.get("id")
+            or extra_info.get("index")
+            or f"gsm8k_{idx:05d}"
+        )
+        items.append(
+            EvalItem(
+                id=str(item_id),
+                prompt=prompt_text,
+                label=ground_truth,
+                metadata={
+                    "dataset": "gsm8k",
+                    "ground_truth_raw": extra_info.get("answer"),
+                    "question": extra_info.get("question"),
+                    "split": extra_info.get("split"),
+                    "data_source": sample.get("data_source"),
+                    "parquet_path": str(path),
+                },
+            )
+        )
+
+    def parse_prediction(text: str, _: EvalItem) -> Optional[str]:
+        return extract_gsm8k_answer(text, method="strict")
+
+    def format_label(item: EvalItem) -> str:
+        return f"#### {item.label}" if item.label else ""
+
+    def format_pred(pred: Optional[str], _: EvalItem) -> Optional[str]:
+        if pred is None:
+            return None
+        return f"#### {pred}"
+
+    def is_correct(item: EvalItem, pred: Optional[str]) -> bool:
+        return bool(item.label) and pred == item.label
+
+    def extras(item: EvalItem, pred: Optional[str]) -> Dict[str, Any]:
+        return {
+            "ground_truth_raw": item.metadata.get("ground_truth_raw"),
+            "question": item.metadata.get("question"),
+            "split": item.metadata.get("split"),
+            "pred_answer": pred,
+        }
+
+    return EvalSpec(
+        name="gsm8k",
         items=items,
         parse_prediction=parse_prediction,
         format_label=format_label,

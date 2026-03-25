@@ -1,18 +1,16 @@
 set -x
 
 python3 -m verl.trainer.main_ppo --config-path=config \
-    --config-name='ppo_trainer_TeleInfer.yaml' \
+    --config-name='ppo_trainer_TeleInfer_GRPO.yaml' \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_test.parquet \
-    # data.train_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
-    # data.val_files=/workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_test.parquet \
+    data.train_files=/workspace/wbh/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
+    data.val_files=/workspace/wbh/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_test.parquet \
     data.train_batch_size=16 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat \
+    actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/model/Meta-Llama-3-8B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
@@ -35,7 +33,7 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.critic_warmup=0 \
     trainer.logger=console \
     trainer.project_name='verl_grpo_wirelessMathBench' \
-    trainer.experiment_name='deepseek_llm_7b_function_rm' \
+    trainer.experiment_name='wirelessMathBench-verl' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
