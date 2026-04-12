@@ -80,9 +80,9 @@ MODEL_SLUG="$(slugify_identifier "${MODEL_BASENAME:-unknown}")"
 DATASET_SLUG="$(slugify_identifier "$(basename "${DATASET_DIR}")")"
 if [[ "${MODEL_BASENAME}" == *235B* || "${MODEL_BASENAME}" == *A22B* ]]; then
     DEFAULT_TENSOR_MODEL_PARALLEL_SIZE=8
-    DEFAULT_TRAIN_BATCH_SIZE=128
-    DEFAULT_PPO_MINI_BATCH_SIZE=32
-    DEFAULT_ROLLOUT_N=4
+    DEFAULT_TRAIN_BATCH_SIZE=64
+    DEFAULT_PPO_MINI_BATCH_SIZE=16
+    DEFAULT_ROLLOUT_N=8
     DEFAULT_GPU_MEMORY_UTILIZATION=0.85
     DEFAULT_ACTOR_PARAM_OFFLOAD=True
     DEFAULT_REF_PARAM_OFFLOAD=True
@@ -97,7 +97,7 @@ elif [[ "${MODEL_BASENAME}" == *32B* || "${MODEL_BASENAME}" == *48B* || "${MODEL
     DEFAULT_TRAIN_BATCH_SIZE=128
     DEFAULT_PPO_MINI_BATCH_SIZE=32
     DEFAULT_ROLLOUT_N=4
-    DEFAULT_GPU_MEMORY_UTILIZATION=0.75
+    DEFAULT_GPU_MEMORY_UTILIZATION=0.55
     DEFAULT_ACTOR_PARAM_OFFLOAD=False
     DEFAULT_REF_PARAM_OFFLOAD=False
     DEFAULT_ACTOR_OPTIMIZER_OFFLOAD=False
@@ -154,6 +154,14 @@ ROLLOUT_LOGPROBS_MODE="${ROLLOUT_LOGPROBS_MODE:-processed_logprobs}"
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.01}"
 TRAINER_PROJECT_NAME="${TRAINER_PROJECT_NAME:-TeleReasoning_GRPO}"
+RUN_TAG="${RUN_TAG:-}"
+RUN_TAG_SLUG=""
+if [[ -n "${RUN_TAG}" ]]; then
+    RUN_TAG_SLUG="$(slugify_identifier "${RUN_TAG}")"
+fi
+if [[ -n "${RUN_TAG_SLUG}" ]]; then
+    DEFAULT_EXPERIMENT_NAME="${DEFAULT_EXPERIMENT_NAME}_${RUN_TAG_SLUG}"
+fi
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${DEFAULT_EXPERIMENT_NAME}}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
@@ -163,8 +171,10 @@ WANDB_PROJECT="${WANDB_PROJECT:-${TRAINER_PROJECT_NAME}}"
 WANDB_NAME="${WANDB_NAME:-${EXPERIMENT_NAME}}"
 WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/outputs/wandb}"
 
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-${REPO_ROOT}/outputs/grpo/checkpoints/${TRAINER_PROJECT_NAME}/${EXPERIMENT_NAME}}"
 ROLL_OUT_DIR="${ROLL_OUT_DIR:-${REPO_ROOT}/outputs/eval/rollout/${EXPERIMENT_NAME}}"
 VAL_DATA_DIR="${VAL_DATA_DIR:-${REPO_ROOT}/outputs/eval/validation/${EXPERIMENT_NAME}}"
+RUN_MANIFEST_PATH="${RUN_MANIFEST_PATH:-${CHECKPOINT_DIR}/launch_config.env}"
 
 CUSTOM_REWARD_PATH="${CUSTOM_REWARD_PATH:-${SCRIPT_DIR}/custom_reward.py}"
 CUSTOM_REWARD_NAME="${CUSTOM_REWARD_NAME:-my_math_reward_fn_deepmath_boxed}"
@@ -175,6 +185,7 @@ ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-${DEFAULT_ROLLOUT_MAX_
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-True}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-${DEFAULT_ENABLE_PREFIX_CACHING}}"
 FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-True}"
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-${DEFAULT_TRUST_REMOTE_CODE}}"
 
 IFS=',' read -r -a visible_gpu_array <<< "${CUDA_VISIBLE_DEVICES}"
@@ -318,23 +329,31 @@ for label, path in (("train", train_path), ("val", val_path)):
         )
 PY
 
-mkdir -p "${ROLL_OUT_DIR}" "${VAL_DATA_DIR}" "${WANDB_DIR}"
+mkdir -p "${CHECKPOINT_DIR}" "${ROLL_OUT_DIR}" "${VAL_DATA_DIR}" "${WANDB_DIR}"
 mkdir -p "${HF_HOME}" "${HF_MODULES_CACHE}" "${TRANSFORMERS_CACHE}"
 mkdir -p "${RUNTIME_CACHE_ROOT}" "${XDG_CACHE_HOME}" "${VLLM_CACHE_ROOT}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${CUDA_CACHE_PATH}" "${OUTLINES_CACHE_DIR}"
 
 if [[ "${RESET_RUNTIME_COMPILE_CACHE}" == "1" || "${RESET_RUNTIME_COMPILE_CACHE}" == "true" || "${RESET_RUNTIME_COMPILE_CACHE}" == "True" ]]; then
     echo "RESET_RUNTIME_COMPILE_CACHE=${RESET_RUNTIME_COMPILE_CACHE}; clearing stale vLLM runtime caches under ${RUNTIME_CACHE_ROOT}"
     rm -rf \
-        "${VLLM_CACHE_ROOT}" \
-        "${XDG_CACHE_HOME}/vllm"
-    mkdir -p \
-        "${VLLM_CACHE_ROOT}" \
+        "${VLLM_RUNTIME_CACHE_ROOT}" \
+        "${VLLM_TORCH_COMPILE_CACHE_DIR}" \
         "${TORCHINDUCTOR_CACHE_DIR}" \
         "${TRITON_CACHE_DIR}" \
-        "${XDG_CACHE_HOME}" \
-        "${VLLM_CACHE_ROOT}/torch_compile_cache" \
-        "${VLLM_CACHE_ROOT}/deep_gemm" \
-        "${VLLM_CACHE_ROOT}/outlines"
+        "${OUTLINES_CACHE_DIR}" \
+        "${CUDA_CACHE_PATH}" \
+        "${RAY_TMPDIR}" \
+        "${TMPDIR}"
+    mkdir -p \
+        "${RUNTIME_CACHE_ROOT}" \
+        "${VLLM_RUNTIME_CACHE_ROOT}" \
+        "${VLLM_TORCH_COMPILE_CACHE_DIR}" \
+        "${TORCHINDUCTOR_CACHE_DIR}" \
+        "${TRITON_CACHE_DIR}" \
+        "${OUTLINES_CACHE_DIR}" \
+        "${CUDA_CACHE_PATH}" \
+        "${RAY_TMPDIR}" \
+        "${TMPDIR}"
 fi
 
 echo "Using REPO_ROOT=${REPO_ROOT}"
@@ -343,6 +362,10 @@ echo "Using model profile for ${MODEL_BASENAME}"
 echo "Using DATASET_DIR=${DATASET_DIR}"
 echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (n_gpus_per_node=${N_GPUS_PER_NODE})"
 echo "Using W&B project=${WANDB_PROJECT} run=${WANDB_NAME}"
+echo "Using EXPERIMENT_NAME=${EXPERIMENT_NAME}"
+echo "Using CHECKPOINT_DIR=${CHECKPOINT_DIR}"
+echo "Using ROLL_OUT_DIR=${ROLL_OUT_DIR}"
+echo "Using VAL_DATA_DIR=${VAL_DATA_DIR}"
 echo "Using CACHE_ROOT=${CACHE_ROOT}"
 echo "Using RUNTIME_CACHE_ROOT=${RUNTIME_CACHE_ROOT}"
 echo "Using RAY_TMPDIR=${RAY_TMPDIR}"
@@ -352,6 +375,40 @@ echo "Using trust_remote_code=${TRUST_REMOTE_CODE}"
 
 TOTAL_TOKEN_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-${TOTAL_TOKEN_LEN}}"
+
+{
+    printf 'LAUNCH_TIME=%s\n' "$(date -Iseconds)"
+    printf 'TRAINER_PROJECT_NAME=%s\n' "${TRAINER_PROJECT_NAME}"
+    printf 'EXPERIMENT_NAME=%s\n' "${EXPERIMENT_NAME}"
+    printf 'WANDB_PROJECT=%s\n' "${WANDB_PROJECT}"
+    printf 'WANDB_NAME=%s\n' "${WANDB_NAME}"
+    printf 'CHECKPOINT_DIR=%s\n' "${CHECKPOINT_DIR}"
+    printf 'ROLL_OUT_DIR=%s\n' "${ROLL_OUT_DIR}"
+    printf 'VAL_DATA_DIR=%s\n' "${VAL_DATA_DIR}"
+    printf 'PRETRAINED_MODEL=%s\n' "${PRETRAINED_MODEL}"
+    printf 'DATASET_DIR=%s\n' "${DATASET_DIR}"
+    printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES}"
+    printf 'TENSOR_MODEL_PARALLEL_SIZE=%s\n' "${TENSOR_MODEL_PARALLEL_SIZE}"
+    printf 'MAX_PROMPT_LENGTH=%s\n' "${MAX_PROMPT_LENGTH}"
+    printf 'MAX_RESPONSE_LENGTH=%s\n' "${MAX_RESPONSE_LENGTH}"
+    printf 'TRAIN_BATCH_SIZE=%s\n' "${TRAIN_BATCH_SIZE}"
+    printf 'PPO_MINI_BATCH_SIZE=%s\n' "${PPO_MINI_BATCH_SIZE}"
+    printf 'ROLLOUT_N=%s\n' "${ROLLOUT_N}"
+    printf 'GPU_MEMORY_UTILIZATION=%s\n' "${GPU_MEMORY_UTILIZATION}"
+    printf 'ROLLOUT_MAX_NUM_SEQS=%s\n' "${ROLLOUT_MAX_NUM_SEQS}"
+    printf 'ROLLOUT_MAX_BATCHED_TOKENS=%s\n' "${ROLLOUT_MAX_BATCHED_TOKENS}"
+    printf 'ROLLOUT_MAX_MODEL_LEN=%s\n' "${ROLLOUT_MAX_MODEL_LEN}"
+    printf 'ENABLE_CHUNKED_PREFILL=%s\n' "${ENABLE_CHUNKED_PREFILL}"
+    printf 'ENABLE_PREFIX_CACHING=%s\n' "${ENABLE_PREFIX_CACHING}"
+    printf 'FREE_CACHE_ENGINE=%s\n' "${FREE_CACHE_ENGINE}"
+    printf 'ROLLOUT_ENFORCE_EAGER=%s\n' "${ROLLOUT_ENFORCE_EAGER}"
+    printf 'USE_KL_LOSS=%s\n' "${USE_KL_LOSS}"
+    printf 'SAVE_FREQ=%s\n' "${SAVE_FREQ}"
+    printf 'TEST_FREQ=%s\n' "${TEST_FREQ}"
+    printf 'TOTAL_EPOCHS=%s\n' "${TOTAL_EPOCHS}"
+    printf 'RUN_TAG=%s\n' "${RUN_TAG}"
+} > "${RUN_MANIFEST_PATH}"
+echo "Wrote launch manifest to ${RUN_MANIFEST_PATH}"
 
 if [[ "${MODEL_BASENAME}" == *235B* || "${MODEL_BASENAME}" == *A22B* ]] && [[ "${N_NODES}" == "1" ]] && [[ "${USE_KL_LOSS}" == "True" ]]; then
     echo "Warning: single-node 235B FlowRL with USE_KL_LOSS=True loads an extra reference policy and often exceeds host RAM." >&2
@@ -387,6 +444,7 @@ CMD=(
     "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}"
     "actor_rollout_ref.rollout.enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL}"
     "actor_rollout_ref.rollout.enable_prefix_caching=${ENABLE_PREFIX_CACHING}"
+    "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}"
     "actor_rollout_ref.rollout.free_cache_engine=${FREE_CACHE_ENGINE}"
     "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${TOTAL_TOKEN_LEN}"
     "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${TOTAL_TOKEN_LEN}"
@@ -416,6 +474,7 @@ CMD=(
     "trainer.logger=${TRAINER_LOGGERS}"
     "trainer.project_name=${TRAINER_PROJECT_NAME}"
     "trainer.experiment_name=${EXPERIMENT_NAME}"
+    "trainer.default_local_dir=${CHECKPOINT_DIR}"
     "trainer.n_gpus_per_node=${N_GPUS_PER_NODE}"
     "trainer.nnodes=${N_NODES}"
     "trainer.resume_mode=auto"
