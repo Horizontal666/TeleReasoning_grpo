@@ -51,7 +51,7 @@ actor_rollout_ref:
 
 reward_model:
   custom_reward_function:
-    path: /workspace/wbh/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/custom_reward.py
+    path: /dpc/kuin0100/bohao/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/custom_reward.py
     name: my_math_reward_fn
     reward_kwargs:
       eps: 1e-6
@@ -62,10 +62,10 @@ reward_model:
 #   filter_overlong_prompts: false
 #   truncation: truncate
 data:
-  # train_files: /workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_train.parquet
-  # val_files:   /workspace/wbh/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_test.parquet
-  train_files: /workspace/wbh/202509_InferenceModel/data/gsm8k/train.parquet
-  val_files:   /workspace/wbh/202509_InferenceModel/data/gsm8k/test.parquet
+  # train_files: /dpc/kuin0100/bohao/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_train.parquet
+  # val_files:   /dpc/kuin0100/bohao/202509_InferenceModel/data/WirelessMathBench/Verl/wirelessMathBench_test.parquet
+  train_files: /dpc/kuin0100/bohao/202509_InferenceModel/data/gsm8k/train.parquet
+  val_files:   /dpc/kuin0100/bohao/202509_InferenceModel/data/gsm8k/test.parquet
   train_batch_size: 4               # 比数据量小很多
   gen_batch_size: null                # 确保不会用到 gen_batch_size
   shuffle: true
@@ -80,7 +80,7 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /workspace/wbh/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/custom_reward.py
+  path: /dpc/kuin0100/bohao/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/custom_reward.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: my_math_reward_fn

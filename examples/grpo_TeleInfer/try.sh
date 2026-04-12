@@ -1,3 +1,10 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/use_project_cache.sh"
+
 python - << 'PY'
 import os, ray
 from vllm import envs
@@ -15,4 +22,3 @@ def show_vllm_use_v1():
 
 print(ray.get(show_vllm_use_v1.remote()))
 PY
-

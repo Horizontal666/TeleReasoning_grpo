@@ -2,14 +2,14 @@ set -x
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/gsm8k/train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/gsm8k/test.parquet \
+    data.train_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/gsm8k/train.parquet \
+    data.val_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/gsm8k/test.parquet \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/model/deepseek-math-7b-instruct \
+    actor_rollout_ref.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/model/deepseek-math-7b-instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -24,7 +24,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
-    critic.model.path=/workspace/wbh/202509_InferenceModel/model/deepseek-math-7b-instruct \
+    critic.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/model/deepseek-math-7b-instruct \
     critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=32 \
     critic.model.fsdp_config.param_offload=False \

@@ -8,7 +8,9 @@ if [[ -z "${PROFILE}" ]]; then
     exit 1
 fi
 
-REPO_ROOT="/workspace/wbh/202509_InferenceModel"
+REPO_ROOT="/dpc/kuin0100/bohao/202509_InferenceModel"
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/use_project_cache.sh"
 FLOWRL_SCRIPT="${REPO_ROOT}/Inference/verl/examples/grpo_TeleInfer/flowrl_qwen3-8b_TeleInfer.sh"
 ANALYZE_SCRIPT="${REPO_ROOT}/Inference/verl/examples/grpo_TeleInfer/analyze_rollout_groups.py"
 EVAL_SCRIPT="${REPO_ROOT}/TeleReasoning_Eval_git/old_vllmUnify/telemath_eval_vllm_mathverify.py"

@@ -1,5 +1,5 @@
 import pandas as pd
-df = pd.read_parquet("/workspace/wbh/202509_InferenceModel/data/gsm8k/test.parquet")
+df = pd.read_parquet("/dpc/kuin0100/bohao/202509_InferenceModel/data/gsm8k/test.parquet")
 print(df.columns)
 print(df.head())
 

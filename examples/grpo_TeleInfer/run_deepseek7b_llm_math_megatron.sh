@@ -1,9 +1,16 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/use_project_cache.sh"
+
 set -x
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 
-gsm8k_train_path=$HOME/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/train.parquet
-gsm8k_test_path=$HOME/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/test.parquet
+gsm8k_train_path=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/gsm8k/train.parquet
+gsm8k_test_path=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/gsm8k/test.parquet
 # math_train_path=$HOME/data/math/train.parquet
 # math_test_path=$HOME/data/math/test.parquet
 

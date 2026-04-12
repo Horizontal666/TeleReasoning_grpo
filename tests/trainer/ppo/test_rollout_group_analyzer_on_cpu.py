@@ -9,7 +9,7 @@ from verl.trainer.ppo.ray_trainer import _build_generation_dump_records
 
 
 ANALYZER_PATH = Path(
-    "/workspace/wbh/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/analyze_rollout_groups.py"
+    "/dpc/kuin0100/bohao/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/analyze_rollout_groups.py"
 )
 
 

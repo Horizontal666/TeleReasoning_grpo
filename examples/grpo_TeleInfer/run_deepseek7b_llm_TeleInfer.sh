@@ -1,16 +1,23 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/use_project_cache.sh"
+
 set -x
 
 python3 -m verl.trainer.main_ppo --config-path=config \
     --config-name='ppo_trainer_TeleInfer_GRPO.yaml' \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_test.parquet \
+    data.train_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_train.parquet \
+    data.val_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/WirelessMathBench/Verl/wirelessMathBench_test.parquet \
     data.train_batch_size=16 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/model/Meta-Llama-3-8B-Instruct \
+    actor_rollout_ref.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/model/Meta-Llama-3-8B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \

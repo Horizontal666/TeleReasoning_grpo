@@ -4,6 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# shellcheck source=/dev/null
+. "${PROJECT_ROOT}/scripts/use_project_cache.sh"
 
 DEFAULT_MODEL="${PROJECT_ROOT}/model/Qwen2.5-7B-Instruct"
 DEFAULT_OUT_DIR="${SCRIPT_DIR}/results/gsm8k_$(date +%Y%m%d_%H%M%S)"

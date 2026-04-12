@@ -6,10 +6,10 @@ import pandas as pd
 
 
 COLLECT_PATH = Path(
-    "/workspace/wbh/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/collect_telemath_eval_metrics.py"
+    "/dpc/kuin0100/bohao/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/collect_telemath_eval_metrics.py"
 )
 SUMMARY_PATH = Path(
-    "/workspace/wbh/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/summarize_telemath_root_cause.py"
+    "/dpc/kuin0100/bohao/202509_InferenceModel/Inference/verl/examples/grpo_TeleInfer/summarize_telemath_root_cause.py"
 )
 
 

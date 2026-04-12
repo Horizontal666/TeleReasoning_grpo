@@ -7,14 +7,14 @@ export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/datasets/gsm8k/test.parquet \
+    data.train_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/gsm8k/train.parquet \
+    data.val_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/datasets/gsm8k/test.parquet \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/model/Qwen3-8B \
+    actor_rollout_ref.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen3-8B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \

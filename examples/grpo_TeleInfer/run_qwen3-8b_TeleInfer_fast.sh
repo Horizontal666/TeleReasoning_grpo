@@ -1,17 +1,19 @@
+#!/usr/bin/env bash
+
 # set -x
 
 # export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 # python3 -m verl.trainer.main_ppo \
 #     algorithm.adv_estimator=grpo \
-#     data.train_files=/workspace/wbh/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/train.parquet \
-#     data.val_files=/workspace/wbh/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/test.parquet \
+#     data.train_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/train.parquet \
+#     data.val_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/test.parquet \
 #     data.train_batch_size=240 \
 #     data.max_prompt_length=512 \
 #     data.max_response_length=1024 \
 #     data.filter_overlong_prompts=True \
 #     data.truncation='error' \
-#     actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/outputs/model_FT_merged/Qwen3-8B-TelecomInstruct_v0.1_peft \
+#     actor_rollout_ref.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/outputs/model_FT_merged/Qwen3-8B-TelecomInstruct_v0.1_peft \
 #     trainer.nnodes=1 \
 #     trainer.n_gpus_per_node=6 \
 #     actor_rollout_ref.model.use_remove_padding=True \
@@ -45,20 +47,25 @@
 #     trainer.total_epochs=5 \
 #     "$@"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+# shellcheck source=/dev/null
+. "${REPO_ROOT}/scripts/use_project_cache.sh"
+
 set -x
 
 export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/wbh/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/train.parquet \
-    data.val_files=/workspace/wbh/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/test.parquet \
+    data.train_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/train.parquet \
+    data.val_files=/dpc/kuin0100/bohao/202509_InferenceModel/data/GRPO/CT_from_finefineweb_commu_5000/test.parquet \
     data.train_batch_size=240 \
     data.max_prompt_length=512 \
     data.max_response_length=7000 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/workspace/wbh/202509_InferenceModel/model/Qwen2.5-7B-Instruct \
+    actor_rollout_ref.model.path=/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen2.5-7B-Instruct \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -89,7 +96,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name='TeleReasoning_GRPO' \
     trainer.experiment_name='Qwen2.5-7B-Instruct_FFWCommu5000_newnewComputeScore_rollout10_0112_fast' \
     trainer.logger='["console","wandb"]' \
-    trainer.rollout_data_dir="/workspace/wbh/202509_InferenceModel/outputs/eval/rollout/FFWCommu5000-qwen2.5-7B-Instruct_rollout10" \
+    trainer.rollout_data_dir="/dpc/kuin0100/bohao/202509_InferenceModel/outputs/eval/rollout/FFWCommu5000-qwen2.5-7B-Instruct_rollout10" \
     trainer.save_freq=20 \
     trainer.test_freq=5 \
     trainer.total_epochs=15 \
