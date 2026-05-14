@@ -15,17 +15,19 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
+from veomni.arguments import OpsImplementationConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models.auto import build_foundation_model
 from veomni.optim import build_lr_scheduler, build_optimizer
+from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import CheckpointConfig
@@ -33,20 +35,25 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import fsdp_version
+from verl.utils.model import convert_weight_keys
 from verl.utils.profiler import log_gpu_memory_usage
-from verl.utils.veomni_utils import (
+from verl.utils.ulysses import (
+    get_ulysses_sequence_parallel_group,
+    set_ulysses_sequence_parallel_group,
+)
+from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimizerConfig
+
+from ..base import BaseEngineCtx, EngineRegistry
+from ..fsdp.transformer_impl import FSDPEngine, FSDPEngineWithLMHead
+from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+from .utils import (
+    MOE_PARAM_HANDERS,
+    VL_TYPE2INDEX,
     load_veomni_model_to_gpu,
     load_veomni_optimizer,
     offload_veomni_model_to_cpu,
     offload_veomni_optimizer,
 )
-from verl.workers.config import HFModelConfig, VeOmniEngineConfig, VeOmniOptimizerConfig
-from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-
-from ..base import BaseEngineCtx, EngineRegistry
-from ..fsdp.transformer_impl import FSDPEngine, FSDPEngineWithLMHead
-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
-from .utils import VL_TYPE2INDEX
 
 logger = logging.getLogger(__file__)
 
@@ -61,36 +68,45 @@ class VeOmniEngine(FSDPEngine):
         **kwargs,
     ):
         """
-        Initialize the FSDPEngine.
+        Initialize the VeOmniEngine.
 
         Sets up distributed device meshes, LoRA, and offload policies based on config.
 
         Args:
-            config: Configuration object with FSDP and model settings.
+            config: Configuration object with VeOmni and model settings.
         """
-
-        # TODO: Preprocessing operations for the MOE model are appended here,
-        # instead of relying on Veomni's transformation scripts.
 
         self.model_config = model_config
         self.engine_config = engine_config
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
-
-        self.mode = None
-
+        # VeOmniEngine only supports fsdp2.
+        self.data_parallel_mode = "fsdp2"
         self.rank = dist.get_rank()
 
+        fsdp_size = self.engine_config.fsdp_size
+        world_size = dist.get_world_size()
+        dp_size = world_size // self.engine_config.ulysses_parallel_size
+
+        if fsdp_size < 0 or fsdp_size >= dp_size:
+            data_parallel_replicate_size = 1
+            data_parallel_shard_size = dp_size
+        else:
+            if dp_size % fsdp_size != 0:
+                raise ValueError(
+                    f"Data parallel size ({dp_size}) must be divisible by fsdp_size ({fsdp_size}). "
+                    "Please adjust your parallel configuration."
+                )
+            data_parallel_replicate_size = dp_size // fsdp_size
+            data_parallel_shard_size = fsdp_size
+
         parallel_state.init_parallel_state(
-            dp_size=self.engine_config.data_parallel_size,
-            dp_replicate_size=self.engine_config.data_parallel_replicate_size,
-            dp_shard_size=self.engine_config.data_parallel_shard_size,
-            tp_size=self.engine_config.tensor_parallel_size,
-            ep_size=self.engine_config.expert_parallel_size,
-            pp_size=self.engine_config.pipeline_parallel_size,
-            cp_size=self.engine_config.context_parallel_size,
+            dp_size=dp_size,
+            dp_replicate_size=data_parallel_replicate_size,
+            dp_shard_size=data_parallel_shard_size,
+            extra_parallel_sizes=(self.engine_config.expert_parallel_size,),
             ulysses_size=self.engine_config.ulysses_parallel_size,
-            dp_mode=self.engine_config.data_parallel_mode,
+            dp_mode=self.data_parallel_mode,
         )
 
         if self.engine_config.full_determinism:
@@ -106,9 +122,9 @@ class VeOmniEngine(FSDPEngine):
         self.ulysses_sequence_parallel_size = self.engine_config.ulysses_parallel_size
 
         if self.use_ulysses_sp:
-            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(parallel_state.get_parallel_state().device_mesh)
+            self.ulysses_parallel_group = parallel_state.get_parallel_state().device_mesh["sp"].get_group()
         else:
-            self.ulysses_sharding_manager = FSDPUlyssesShardingManager(None)
+            self.ulysses_parallel_group = None
 
         if self.engine_config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
@@ -136,6 +152,7 @@ class VeOmniEngine(FSDPEngine):
             lr_scheduler=self.lr_scheduler,
             processing_class=self.model_config.get_processor(),
             checkpoint_config=self.checkpoint_config,
+            trust_remote_code=self.model_config.trust_remote_code,
         )
 
         self.to(
@@ -157,7 +174,7 @@ class VeOmniEngine(FSDPEngine):
         )
         get_optimizer_pre_hook = getattr(module, "get_optimizer_pre_hook", None)
         if get_optimizer_pre_hook is not None:
-            optimizer_pre_hook = get_optimizer_pre_hook(module, module.config, self.engine_config.data_parallel_mode)
+            optimizer_pre_hook = get_optimizer_pre_hook(module, module.config, self.data_parallel_mode)
             optimizer.register_step_pre_hook(optimizer_pre_hook)
 
         return optimizer
@@ -178,13 +195,26 @@ class VeOmniEngine(FSDPEngine):
         return lr_scheduler
 
     def _build_model_optimizer(self):
-        # Load base model with specified configuration and dtype
-        module = build_foundation_model(
-            config_path=self.model_config.hf_config_path,
-            weights_path=self.model_config.path,
-            torch_dtype="float32" if self.engine_config.mixed_precision else "bfloat16",
+        # build_foundation_model runs apply_ops_config(ops_implementation)
+        # before constructing the model, so per-model device_patch files see
+        # the resolved kernel backends.
+        ops_implementation = OpsImplementationConfig(
             attn_implementation=self.engine_config.attn_implementation,
             moe_implementation=self.engine_config.moe_implementation,
+            cross_entropy_loss_implementation=self.engine_config.cross_entropy_loss_implementation,
+            rms_norm_implementation=self.engine_config.rms_norm_implementation,
+            swiglu_mlp_implementation=self.engine_config.swiglu_mlp_implementation,
+            rotary_pos_emb_implementation=self.engine_config.rotary_pos_emb_implementation,
+            load_balancing_loss_implementation=self.engine_config.load_balancing_loss_implementation,
+        )
+
+        # Load base model with specified configuration and dtype
+        module = build_foundation_model(
+            config_path=self.model_config.local_hf_config_path,
+            weights_path=self.model_config.local_path,
+            torch_dtype="float32" if self.engine_config.mixed_precision else "bfloat16",
+            attn_implementation=self.engine_config.attn_implementation,
+            ops_implementation=ops_implementation,
             init_device=self.engine_config.init_device,
         )
         log_gpu_memory_usage("After load base model", logger=logger)
@@ -194,12 +224,14 @@ class VeOmniEngine(FSDPEngine):
         module = build_parallelize_model(
             module,
             init_device=self.engine_config.init_device,
-            weights_path=self.model_config.path,
+            weights_path=self.model_config.local_path,
             enable_full_shard=self.engine_config.enable_full_shard,
             enable_mixed_precision=self.engine_config.mixed_precision,
             enable_gradient_checkpointing=self.model_config.enable_gradient_checkpointing,
             enable_fsdp_offload=self.engine_config.enable_fsdp_offload,
-            basic_modules=module._no_split_modules + self.engine_config.basic_modules,
+            basic_modules=list(
+                set(getattr(module, "_no_split_modules", None) or []) | set(self.engine_config.basic_modules)
+            ),
             enable_reentrant=self.engine_config.enable_reentrant,
             enable_forward_prefetch=self.engine_config.forward_prefetch,
         )
@@ -222,34 +254,6 @@ class VeOmniEngine(FSDPEngine):
             self.model_config.enable_gradient_checkpointing,
             self.engine_config.activation_gpu_limit,
         )
-
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
-        """
-        Move model parameters, optimizer states, or both to the specified device.
-        Note that this function executes irrespective of offload config. It serves as manual control.
-
-        Args:
-            device: Target device identifier.
-            model: If True, move the model.
-            optimizer: If True, move the optimizer states.
-        """
-        super(FSDPEngine, self).to(device=device, model=model, optimizer=optimizer, grad=grad)
-
-        device_name = get_device_name()
-
-        assert device in (device_name, "cpu")
-        if device == device_name:
-            if model:
-                load_veomni_model_to_gpu(self.module)
-            if optimizer and self.optimizer is not None:
-                load_veomni_optimizer(self.optimizer, device)
-        elif device == "cpu":
-            if model:
-                offload_veomni_model_to_cpu(self.module)
-            if optimizer and self.optimizer is not None:
-                offload_veomni_optimizer(self.optimizer)
-        else:
-            raise ValueError(f"Invalid device type: {device}")
 
     def optimizer_step(self):
         """
@@ -322,6 +326,12 @@ class VeOmniEngine(FSDPEngine):
         else:
             return torch.distributed.group.WORLD
 
+    def get_model_parallel_group(self):
+        raise NotImplementedError
+
+    def get_context_parallel_group(self):
+        raise NotImplementedError
+
     def is_mp_src_rank_with_outputs(self):
         """
         Whether the current rank is the first rank in model parallel group that contains model outputs
@@ -348,6 +358,117 @@ class VeOmniEngine(FSDPEngine):
         """
         return EngineEvalModeCtx(self, **kwargs)
 
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        """
+        Move model parameters, optimizer states, or both to the specified device.
+        Note that this function executes irrespective of offload config. It serves as manual control.
+
+        Args:
+            device: Target device identifier.
+            model: If True, move the model.
+            optimizer: If True, move the optimizer states.
+        """
+        super(FSDPEngine, self).to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+        device_name = get_device_name()
+
+        assert device in (device_name, "cpu")
+        if device == device_name:
+            if model:
+                load_veomni_model_to_gpu(self.module)
+            if optimizer and self.optimizer is not None:
+                load_veomni_optimizer(self.optimizer, device)
+        elif device == "cpu":
+            if model:
+                offload_veomni_model_to_cpu(self.module)
+            if optimizer and self.optimizer is not None:
+                offload_veomni_optimizer(self.optimizer)
+        else:
+            raise ValueError(f"Invalid device type: {device}")
+
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: Optional[str] = None,
+        global_step: int = 0,
+        max_ckpt_to_keep: Optional[int] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Save VeOmni checkpoint, handling parameter offload as needed.
+        """
+        origin_module_device = next(self.module.parameters()).device.type
+        if self._is_offload_param or origin_module_device == "cpu":
+            load_veomni_model_to_gpu(self.module)
+
+        self.checkpoint_manager.save_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+        )
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_veomni_model_to_cpu(self.module)
+
+    def load_checkpoint(
+        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
+    ) -> None:
+        """
+        Load VeOmni checkpoint, restoring parameters and optimizer state.
+        """
+        if self._is_offload_param:
+            load_veomni_model_to_gpu(self.module)
+
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+        )
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_veomni_model_to_cpu(self.module)
+
+        if self._is_offload_optimizer:
+            offload_veomni_optimizer(self.optimizer)
+
+    def get_per_tensor_param(self, **kwargs):
+        load_veomni_model_to_gpu(self.module)
+
+        params = self.module.state_dict()
+        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+
+        if self._is_offload_param:
+            offload_veomni_model_to_cpu(self.module)
+
+        device = get_device_id()
+        ps = parallel_state.get_parallel_state()
+        model_type = getattr(self.module.config, "model_type", "default")
+        process_func = MOE_PARAM_HANDERS.get(model_type, lambda n, t: iter([(n, t)]))
+
+        def param_generator():
+            for name, param in params.items():
+                unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
+
+                is_expert_layer = "mlp.experts." in name
+                is_proj = any(p in name for p in ["down_proj", "gate_proj", "up_proj", "gate_up_proj"])
+
+                if is_expert_layer and is_proj and ps.ep_enabled:
+                    output_shape = list(unsharded_tensor.shape)
+                    output_shape[0] *= ps.ep_size
+                    stacked_tensor = torch.empty(output_shape, dtype=unsharded_tensor.dtype, device=device)
+
+                    # all gather expert tensors [32, H, I] -> [128, H, I]
+                    torch.distributed.all_gather_into_tensor(stacked_tensor, unsharded_tensor, group=ps.ep_group)
+                    yield from process_func(name, stacked_tensor)
+
+                    del stacked_tensor
+                else:
+                    if is_expert_layer:
+                        yield from process_func(name, unsharded_tensor)
+                    else:
+                        yield name, unsharded_tensor
+
+        # TODO: support VeOmni LoRA
+        return param_generator(), None
+
 
 class EngineEvalModeCtx(BaseEngineCtx):
     def __init__(self, engine: VeOmniEngine, **kwargs):
@@ -356,12 +477,13 @@ class EngineEvalModeCtx(BaseEngineCtx):
     def __enter__(self):
         assert isinstance(self.engine, VeOmniEngine)
         super().__enter__()
-        self.engine.ulysses_sharding_manager.__enter__()
+        self.prev_sp_group = get_ulysses_sequence_parallel_group()
+        set_ulysses_sequence_parallel_group(self.engine.ulysses_parallel_group)
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, VeOmniEngine)
-        self.engine.ulysses_sharding_manager.__exit__(exc_type, exc_value, traceback)
+        set_ulysses_sequence_parallel_group(self.prev_sp_group)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
@@ -381,12 +503,15 @@ class EngineTrainModeCtx(BaseEngineCtx):
     def __enter__(self):
         assert isinstance(self.engine, VeOmniEngine)
         super().__enter__()
-        self.engine.ulysses_sharding_manager.__enter__()
+        self.prev_sp_group = get_ulysses_sequence_parallel_group()
+        set_ulysses_sequence_parallel_group(self.engine.ulysses_parallel_group)
+        # TODO: Switch to eval mode after Integrating the CI environment
+        # VeOmni (ref: https://github.com/ByteDance-Seed/VeOmni/pull/421)
         self.engine.module.train()
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, VeOmniEngine)
-        self.engine.ulysses_sharding_manager.__exit__(exc_type, exc_value, traceback)
+        set_ulysses_sequence_parallel_group(self.prev_sp_group)
         self.engine.optimizer_zero_grad()
         super().__exit__(exc_type, exc_value, traceback)
 
@@ -408,6 +533,21 @@ class OmniSequenceShardCollator:
         metadata={"help": "features to slice sequence dimension."},
     )
 
+    # features to padding sequence dimension
+    padding_features: dict[str, int] = field(
+        default_factory=lambda: {
+            "pixel_values": 0,
+            "pixel_values_videos": 0,
+        },
+        metadata={"help": "features to padding sequence dimension."},
+    )
+
+    # padding scale for padding features
+    padding_scale: dict[str, int] = field(
+        default_factory=lambda: {"pixel_values": 4, "pixel_values_videos": 4},
+        metadata={"help": "padding scale for padding features."},
+    )
+
     def __post_init__(self):
         self.sp_size = parallel_state.get_parallel_state().sp_size
         self.sp_rank = parallel_state.get_parallel_state().sp_rank
@@ -417,7 +557,35 @@ class OmniSequenceShardCollator:
         sp_chunk_size = (seq_length + self.sp_size - 1) // self.sp_size
         return feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
 
+    def sp_padding(
+        self, tensor: "torch.Tensor", dim: int = -1, pad_value: int = 0, pad_scale: int = 1
+    ) -> "torch.Tensor":
+        """
+        Pads a tensor with pad_length to aligns tensor with sp size.
+        """
+        seq_length = tensor.size(dim)
+        scale_sp_size = self.sp_size * pad_scale
+
+        sp_chunk_size = (seq_length + scale_sp_size - 1) // scale_sp_size
+        pad_size = sp_chunk_size * scale_sp_size - seq_length
+        if pad_size == 0:
+            return tensor
+
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        pad = torch.full(pad_shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat((tensor, pad), dim=dim)
+
     def __call__(self, batch: Sequence[dict[str, "torch.Tensor"]]) -> dict[str, "torch.Tensor"]:
+        for key in batch.keys():
+            if key in self.padding_features.keys():
+                batch[key] = self.sp_padding(
+                    batch[key],
+                    dim=self.sp_slice_features.get(key, -1),
+                    pad_value=self.padding_features[key],
+                    pad_scale=self.padding_scale.get(key, 1),
+                )
+
         # sp slice
         for key in batch.keys():
             if key in self.sp_slice_features.keys():
@@ -426,19 +594,71 @@ class OmniSequenceShardCollator:
         return batch
 
 
+def _prepare_veomni_flash_attention_kwargs(position_ids: torch.Tensor) -> dict[str, torch.Tensor | int]:
+    """Normalize packed position_ids layout and derive varlen FlashAttention kwargs.
+
+    Supported formats for use_remove_padding=true:
+        - 2D: (1, total_nnz) - standard packed format
+        - 3D: (rope_dim, 1, total_nnz) - VeRL mRoPE packed format
+    """
+    if position_ids.dim() == 2:
+        # (1, total_nnz) - standard packed format
+        fa_position_ids = position_ids
+    elif position_ids.dim() == 3:
+        # (rope_dim, 1, total_nnz) - VeRL mRoPE packed format
+        if position_ids.shape[1] == 1:
+            fa_position_ids = position_ids[0]
+        else:
+            raise ValueError(
+                f"Unsupported 3D position_ids shape: {tuple(position_ids.shape)}, expected (rope_dim, 1, total_nnz)"
+            )
+    else:
+        raise ValueError(
+            f"Unsupported position_ids rank: {position_ids.dim()}, "
+            f"expected 2 (1, total_nnz) or 3 (rope_dim, 1, total_nnz)"
+        )
+
+    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = prepare_fa_kwargs_from_position_ids(fa_position_ids)
+    return {
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "cu_seq_lens_k": cu_seq_lens_k,
+        "max_length_q": max_length_q,
+        "max_length_k": max_length_k,
+    }
+
+
 @EngineRegistry.register(model_type="language_model", backend=["veomni"], device=["cuda", "npu"])
 class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        # TODO: Cannot work properly for qwen_vl ulysses
         model_inputs, output_args = super().prepare_model_inputs(micro_batch)
         input_ids_rmpad = model_inputs["input_ids"]
+        sp_enabled = parallel_state.get_parallel_state().sp_enabled
+        sp_shard_collator = OmniSequenceShardCollator() if sp_enabled else None
+
         if self.module.config.model_type in VL_TYPE2INDEX.keys():
             image_mask = input_ids_rmpad == VL_TYPE2INDEX[self.module.config.model_type]["IMAGE_INPUT_INDEX"]
             video_mask = input_ids_rmpad == VL_TYPE2INDEX[self.module.config.model_type]["VIDEO_INPUT_INDEX"]
             model_inputs.update({"image_mask": image_mask, "video_mask": video_mask})
 
-            if parallel_state.get_parallel_state().sp_enabled:
-                omni_sequence_shard_collator = OmniSequenceShardCollator()
-                omni_sequence_shard_collator(model_inputs)
+            if sp_enabled:
+                sp_shard_collator(model_inputs)
+
+        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+        if use_remove_padding and model_inputs.get("position_ids", None) is not None:
+            model_inputs.update(_prepare_veomni_flash_attention_kwargs(model_inputs["position_ids"]))
+            if sp_enabled:
+                model_inputs["position_ids"] = sp_shard_collator.sp_slice(model_inputs["position_ids"], dim=-1)
+
+        # Activate VeOmni's chunk_logprobs path: ForCausalLMLoss short-circuits
+        # to per-token log_probs/entropy on return_log_probs=True. Pass the
+        # already-rolled labels as shift_labels so chunk_logprobs skips its
+        # internal causal shift and the output seq length matches the input —
+        # prepare_model_outputs().squeeze(0) then lands at (total_nnz,).
+        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+        if use_fused_kernels and use_remove_padding:
+            shift_labels = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+            model_inputs["labels"] = input_ids_rmpad
+            model_inputs["shift_labels"] = shift_labels
+            model_inputs["return_log_probs"] = True
 
         return model_inputs, output_args

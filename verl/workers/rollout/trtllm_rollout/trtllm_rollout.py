@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,24 +16,33 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import gc
 import logging
 import os
 import pickle
 import threading
 from contextlib import asynccontextmanager
-from typing import Any, Generator, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import aiohttp
 import pynvml
 import ray
 import torch
 import torch.distributed as dist
+
+try:
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+except (ImportError, RuntimeError):
+    # RuntimeError: FlashInfer's check_cuda_arch() crashes on CPU-only actors
+    ExecutorMemoryType = None
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
 
+from verl.utils.device import get_torch_device
+from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.utils import is_valid_ipv6_address
+from verl.workers.rollout.utils import ensure_async_iterator
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -44,21 +53,6 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY = 2.0
 DEFAULT_MAX_CONNECTIONS = 2000
 DEFAULT_MAX_WAIT_TIME = 300.0
-
-
-def device_id_to_physical_device_id(id: int) -> int:
-    """Convert a logical device ID to a physical device ID considering CUDA_VISIBLE_DEVICES."""
-    if "CUDA_VISIBLE_DEVICES" in os.environ:
-        device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-        try:
-            physical_device_id = int(device_ids[id])
-            return physical_device_id
-        except (ValueError, IndexError) as err:
-            raise RuntimeError(
-                f"Failed to convert logical device ID {id} to physical device ID. Available devices are: {device_ids}."
-            ) from err
-    else:
-        return id
 
 
 @contextlib.contextmanager
@@ -84,8 +78,9 @@ _NVML_INITIALIZED = False
 _NVML_LOCK = threading.Lock()
 
 
-def get_device_uuid(id: int) -> str:
+def get_device_uuid(id: str | int) -> str:
     """Get the UUID of a CUDA device using NVML."""
+    id = int(id)  # pynvml expects int; ray.get_gpu_ids() may return str
     global _NVML_INITIALIZED
     with _NVML_LOCK:
         if not _NVML_INITIALIZED:
@@ -95,12 +90,9 @@ def get_device_uuid(id: int) -> str:
             except pynvml.NVMLError as e:
                 raise RuntimeError(f"Failed to initialize NVML: {e}") from e
 
-    # The process has visibility to all GPUs within the TP group
-    global_device_idx = device_id_to_physical_device_id(id)
-
     # Get the device handle and UUID
     try:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(global_device_idx)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(id)
         uuid = pynvml.nvmlDeviceGetUUID(handle)
         # Ensure the UUID is returned as a string, not bytes
         if isinstance(uuid, bytes):
@@ -108,11 +100,9 @@ def get_device_uuid(id: int) -> str:
         elif isinstance(uuid, str):
             return uuid
         else:
-            raise RuntimeError(
-                f"Unexpected UUID type: {type(uuid)} for device {id} (global index: {global_device_idx})"
-            )
+            raise RuntimeError(f"Unexpected UUID type: {type(uuid)} for device {id} (global index: {id})")
     except pynvml.NVMLError as e:
-        raise RuntimeError(f"Failed to get device UUID for device {id} (global index: {global_device_idx}): {e}") from e
+        raise RuntimeError(f"Failed to get device UUID for device {id} (global index: {id}): {e}") from e
 
 
 async def _read_async_response(resp: aiohttp.ClientResponse) -> dict[str, Any]:
@@ -276,16 +266,23 @@ class AsyncTRTLLMHttpAdapter:
 
 
 class ServerAdapter(BaseRollout):
-    _WEIGHTS_TAGS = [
-        "sampler",
-        "drafter",
-        "guided_decoder",
-        "spec_resource_manager",
-        "model_extra",
-        "executor_extra",
-        "model",
-        "draft_model",
-    ]
+    # All releasable/resumable weight tags: every ExecutorMemoryType except kv_cache
+    # (handled separately) and internal tags prefixed with "_".
+    # Fallback to hard-coded list for trtllm versions that don't export ExecutorMemoryType.
+    _WEIGHTS_TAGS = (
+        [t.value for t in ExecutorMemoryType if t is not ExecutorMemoryType.KV_CACHE and not t.value.startswith("_")]
+        if ExecutorMemoryType is not None
+        else [
+            "sampler",
+            "drafter",
+            "guided_decoder",
+            "spec_resource_manager",
+            "model_extra",
+            "executor_extra",
+            "model",
+            "draft_model",
+        ]
+    )
 
     @staticmethod
     def get_full_tags() -> list[str]:
@@ -294,6 +291,15 @@ class ServerAdapter(BaseRollout):
     def __init__(
         self, config: RolloutConfig, model_config: HFModelConfig, device_mesh: DeviceMesh, replica_rank: int = -1
     ):
+        if config.get("quantization", None) == "fp8":
+            FP8_BLOCK_QUANT_KWARGS = {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            }
+            fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+            model_config.hf_config.quantization_config = fp8_block_quant_kwargs
         super().__init__(config, model_config, device_mesh)
         self._adapter = None
         self.hybrid_device_mesh = None
@@ -301,6 +307,7 @@ class ServerAdapter(BaseRollout):
         self.is_leader_rank = None
         self.replica_rank = None
         self.is_dp_rank = None
+        self._supports_partial_loading = None
 
         # hybrid mode
         if self.device_mesh is not None:
@@ -325,18 +332,49 @@ class ServerAdapter(BaseRollout):
             rank = int(os.environ["RANK"])
             self.replica_rank = replica_rank
             self.is_leader_rank = rank == 0
+            # Required for CUDA IPC handle creation during weight sync for Async RL.
+            # Reward/ref models skip weight sync so this can be None.
+            self.gpu_id = ray.get_gpu_ids()[0]
 
         # Below is required for all modes.
         assert self.replica_rank >= 0, "replica_rank is not set"
         assert self.is_leader_rank is not None, "is_leader_rank is not set"
 
-        print(f"ServerAdapter, replica_rank: {self.replica_rank}, is_leader_rank: {self.is_leader_rank}")
-
         self.node_ip = ray.util.get_node_ip_address().strip("[]")
+
+    async def get_supports_partial_loading(self) -> bool:
+        """Query and cache whether the model supports partial weight loading."""
+        if self._supports_partial_loading is not None:
+            return self._supports_partial_loading
+
+        await self._init_server_adapter()
+        try:
+            self._supports_partial_loading = await self.server_actor.supports_partial_loading.remote()
+        except Exception as e:
+            logger.warning(f"Failed to query partial loading support: {e}, defaulting to False")
+            self._supports_partial_loading = False
+
+        logger.info(f"Model supports partial loading: {self._supports_partial_loading}")
+        return self._supports_partial_loading
 
     async def _init_server_adapter(self):
         if self._adapter is not None:
             return
+
+        # Standalone mode: lazily build the CPU device mesh from the gloo process group
+        # (initialized by initialize_global_process_group_ray before ServerAdapter construction).
+        # Reward/ref models that never call resume(), release(), or update_weights() will never build the mesh.
+        if self.hybrid_device_mesh is None and self.device_mesh is None:
+            assert dist.is_initialized(), "gloo process group must be initialized before building device mesh"
+            infer_tp = self.config.tensor_model_parallel_size
+            infer_pp = getattr(self.config, "pipeline_model_parallel_size", 1)
+            world_size = dist.get_world_size()
+            dp = world_size // (infer_tp * infer_pp)
+            self.hybrid_device_mesh = init_device_mesh(
+                "cpu", mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
+            )
+            self.hybrid_device_mesh[self.hybrid_device_mesh.mesh_dim_names[1:]]._flatten(mesh_dim_name="exclude_dp")
+            self.is_leader_rank = self.hybrid_device_mesh["exclude_dp"].get_local_rank() == 0
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         self.server_actor = ray.get_actor(f"trtllm_server_{self.replica_rank}")
@@ -348,6 +386,10 @@ class ServerAdapter(BaseRollout):
         self._adapter = AsyncTRTLLMHttpAdapter(
             host=host,
             port=server_port,
+            timeout=self.config.server.timeout,
+            max_attempts=self.config.server.max_attempts,
+            retry_delay=self.config.server.retry_delay,
+            max_connections=self.config.server.max_connections,
         )
 
     async def resume(self, tags: list[str]):
@@ -356,6 +398,11 @@ class ServerAdapter(BaseRollout):
         Args:
             tag: weights or kv_cache.
         """
+        # Synchronize all ranks before resuming KV cache to ensure non-leader ranks
+        # have completed actor offloading to CPU, preventing OOM issue.
+        if "kv_cache" in tags and self.config.free_cache_engine:
+            group = self.hybrid_device_mesh["exclude_dp"].get_group() if self.hybrid_device_mesh is not None else None
+            await asyncio.to_thread(dist.barrier, group=group)
         if self.is_leader_rank and self.config.free_cache_engine:
             if "weights" in tags:
                 tags = self._WEIGHTS_TAGS
@@ -374,11 +421,16 @@ class ServerAdapter(BaseRollout):
             await self._adapter.release_memory_occupation(tags=tags)
 
     async def update_weights_from_ipc_handles(self, device_handles):
-        assert self.hybrid_device_mesh is not None, "hybrid_device_mesh is not set"
-
         """Update weights from IPC handles."""
+        if self.hybrid_device_mesh is not None:
+            world_size = self.hybrid_device_mesh["exclude_dp"].size()
+            group = self.hybrid_device_mesh["exclude_dp"].get_group()
+        else:
+            world_size = dist.get_world_size()
+            group = None
+
         if self.is_leader_rank:
-            gathered_handles = [None for _ in range(self.hybrid_device_mesh["exclude_dp"].size())]
+            gathered_handles = [None for _ in range(world_size)]
         else:
             gathered_handles = None
 
@@ -387,18 +439,18 @@ class ServerAdapter(BaseRollout):
             obj=device_handles,
             object_gather_list=gathered_handles,
             group_dst=0,
-            group=self.hybrid_device_mesh["exclude_dp"].get_group(),
+            group=group,
         )
 
         if self.is_leader_rank:
             all_handles = {k: v for d in gathered_handles for k, v in d.items()}
             await self._adapter.update_weights(all_handles)
 
-        await asyncio.to_thread(dist.barrier, group=self.hybrid_device_mesh["exclude_dp"].get_group())
+        await asyncio.to_thread(dist.barrier, group=group)
 
-    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
-        assert self.hybrid_device_mesh is not None, "hybrid_device_mesh is not set"
-
+    async def update_weights(
+        self, weights: AsyncGenerator[tuple[str, torch.Tensor], None], global_steps: int = None, **kwargs
+    ):
         """Update the weights of the rollout model.
 
         Args:
@@ -407,13 +459,21 @@ class ServerAdapter(BaseRollout):
         if self.is_leader_rank:
             await self._init_server_adapter()
 
-        total_available_bytes = int(self.config.update_weights_bucket_megabytes) * 1024 * 1024
+        total_available_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) * 1024 * 1024
+
+        if self.config.get("quantization", None) == "fp8":
+            from verl.utils.trtllm.trtllm_fp8_utils import TRTLLMFP8QuantizerHelper
+
+            fp8_quantizer_helper = TRTLLMFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
+            weights = fp8_quantizer_helper.quant_weights_by_name(
+                weights,
+                dtype=self.model_config.hf_config.dtype,
+            )
 
         try:
-            device_uuid = get_device_uuid(self.gpu_id)
+            device_uuid = get_device_uuid(int(self.gpu_id))
         except Exception as e:
-            logger.error(f"Failed to get device UUID: {e}")
-            logger.error("Did you miss to set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 before ray start?")
+            logger.error(f"Failed to get device UUID in update_weights(): {e}")
             device_uuid = None
             raise e
 
@@ -429,16 +489,35 @@ class ServerAdapter(BaseRollout):
             cur_available_bytes = total_available_bytes
             cur_handles = []
 
-        for name, param in weights:
-            size_in_bytes = param.element_size() * param.numel()
-            if size_in_bytes > cur_available_bytes:
-                await flush()
+        # For non-VLM, always use partial loading. For VLM, leader queries and broadcasts to all
+        # ranks in the DP replica; use get_global_rank(group, 0) since each replica has a different leader.
+        is_vlm = self.model_config.hf_config is not None and hasattr(self.model_config.hf_config, "vision_config")
+        if not is_vlm:
+            supports_partial_loading = True
+        else:
+            exclude_dp_group = self.hybrid_device_mesh["exclude_dp"].get_group()
+            spl_tensor = torch.zeros(1, dtype=torch.int32)
+            if self.is_leader_rank:
+                supports_partial_loading = await self.get_supports_partial_loading()
+                spl_tensor[0] = int(supports_partial_loading)
+            leader_global_rank = dist.get_global_rank(exclude_dp_group, 0)
+            await asyncio.to_thread(dist.broadcast, spl_tensor, src=leader_global_rank, group=exclude_dp_group)
+            supports_partial_loading = bool(spl_tensor.item())
 
-            assert cur_available_bytes >= size_in_bytes, (
-                f"cur_available_bytes: {cur_available_bytes:,} size_in_bytes: {size_in_bytes:,} name: {name}"
-            )
-            cur_available_bytes -= size_in_bytes
-            handle = reduce_tensor(param.detach())
+        async for name, param in ensure_async_iterator(weights):
+            if supports_partial_loading:
+                size_in_bytes = param.element_size() * param.numel()
+                if size_in_bytes > cur_available_bytes:
+                    await flush()
+
+                assert cur_available_bytes >= size_in_bytes, (
+                    f"cur_available_bytes: {cur_available_bytes:,} size_in_bytes: {size_in_bytes:,} name: {name}"
+                )
+                cur_available_bytes -= size_in_bytes
+
+            # Clone so the IPC handle owns the data to avoid buffer reuse
+            # before TRT-LLM reads it, which will silently corrupt weights.
+            handle = reduce_tensor(param.detach().clone())
             cur_handles.append((name, handle))
 
         await flush()
@@ -446,4 +525,14 @@ class ServerAdapter(BaseRollout):
         if self.is_leader_rank:
             # Finalize update weights
             await self._adapter.update_weights(None)
-        await asyncio.to_thread(dist.barrier, group=self.hybrid_device_mesh["exclude_dp"].get_group())
+            if global_steps is not None:
+                await self.server_actor.set_global_steps.remote(global_steps)
+        group = self.hybrid_device_mesh["exclude_dp"].get_group() if self.hybrid_device_mesh is not None else None
+        await asyncio.to_thread(dist.barrier, group=group)
+
+        del weights
+        gc.collect()
+        get_torch_device().empty_cache()
+
+    def _get_attribute(self, name: str):
+        return getattr(self, name)

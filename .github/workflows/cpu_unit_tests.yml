@@ -12,7 +12,7 @@
 # - `special_sanity`: a suite of quick sanity tests
 # - `special_standalone`: a set of test that are designed to run in dedicated environments
 
-# Accelerators for tests 
+# Accelerators for tests
 # - By default tests are run with GPU available, except for the ones under `special_npu`, and any test script whose name ends with `on_cpu.py`.
 # - For test scripts with `on_cpu.py` name suffix would be tested on CPU resources in linux environment.
 
@@ -29,7 +29,6 @@
 #     - new workflow yaml is added to `.github/workflows`
 #     - new tests are added to workflow mentioned in 2.
 
-
 name: cpu_unit_tests
 
 on:
@@ -45,6 +44,7 @@ on:
       - v0.*
     paths:
       - "**/*.py"
+      - "!tests/special_sanity/**"
       - .github/workflows/cpu_unit_tests.yml
 
 # Cancel jobs on the same ref if a new one is triggered
@@ -57,12 +57,12 @@ permissions:
   contents: read
 
 env:
-  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:vllm012.dev3"
+  IMAGE: "verl-ci-cn-beijing.cr.volces.com/verlai/verl:vllm018.dev1"
   DYNAMIC_RUNNER_ENDPOINT: "https://sd10g3clalm04ug7alq90.apigateway-cn-beijing.volceapi.com/runner"
 
 jobs:
   setup:
-    if: github.repository_owner == 'volcengine'
+    if: github.repository_owner == 'verl-project'
     runs-on: ubuntu-latest
     outputs:
       runner-label: ${{ steps.create-runner.outputs.runner-label }}
@@ -81,7 +81,6 @@ jobs:
     runs-on: ["${{ needs.setup.outputs.runner-label || 'L20x8' }}"]
     timeout-minutes: 20 # Increase this timeout value as needed
     env:
-      HTTP_PROXY: ${{ secrets.PROXY_HTTP }}
       HTTPS_PROXY: ${{ secrets.PROXY_HTTPS }}
       NO_PROXY: "localhost,127.0.0.1,hf-mirror.com"
       HF_ENDPOINT: "https://hf-mirror.com"
@@ -96,7 +95,6 @@ jobs:
         run: |
           pip3 install -r requirements-test.txt
           pip3 install --no-deps -e .
-          pip3 install --upgrade transformers
       - name: Download datasets
         run: |
           python3 examples/data_preprocess/gsm8k.py --local_dataset_path ${HOME}/models/hf_data/gsm8k

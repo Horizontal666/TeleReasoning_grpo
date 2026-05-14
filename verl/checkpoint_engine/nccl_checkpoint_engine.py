@@ -17,14 +17,23 @@ import os
 import time
 from dataclasses import dataclass
 from typing import AsyncGenerator, Generator
+from unittest.mock import patch
 
-import cupy as cp
+with patch("importlib.metadata.distributions", return_value=[]):
+    import cupy as cp
+
 import ray
 import ray.util.collective as collective
 import torch
 import zmq
 
-from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from verl.checkpoint_engine.base import (
+    CheckpointEngine,
+    CheckpointEngineRegistry,
+    TensorMeta,
+    merge_weight_chunks,
+    split_weight_chunks,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -134,7 +143,7 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         return MasterMetadata(zmq_ip=self.ip, zmq_port=self.listen_port) if self.is_master else None
 
-    def finish(self):
+    def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
         if self.rebuild_group:
             if self.rank >= 0:
@@ -145,9 +154,25 @@ class NCCLCheckpointEngine(CheckpointEngine):
         self.send_buf = None
         self.recv_buf = None
 
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        trainer_kwargs = {
+            "rank": [0] + [-1] * (trainer_world_size - 1),
+            "world_size": [rollout_world_size + 1] * trainer_world_size,
+            "master_metadata": [metadata[0]] * trainer_world_size,
+        }
+        rollout_kwargs = {
+            "rank": list(range(1, rollout_world_size + 1)),
+            "world_size": [rollout_world_size + 1] * rollout_world_size,
+            "master_metadata": [metadata[0]] * rollout_world_size,
+        }
+        return trainer_kwargs, rollout_kwargs
+
     def _start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
-        self.listen_port, self.listen_sock = get_free_port(self.ip)
+        self.listen_port, _ = get_free_port(self.ip)
 
         context = zmq.Context()
         self.socket = context.socket(zmq.PUB)
@@ -222,12 +247,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
         offset = 0
-        for name, weight in weights:
-            # model parameters are in fp32 full precsion
-            weight = weight.to(self.rollout_dtype)
-
+        async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
-            if offset + weight.nbytes > self.bucket_size:
+            if offset + tensor_meta.chunk_size > self.bucket_size:
                 torch.cuda.synchronize()
 
                 # wait previous broadcast op finish
@@ -248,18 +270,13 @@ class NCCLCheckpointEngine(CheckpointEngine):
                 bucket_meta = {}
                 offset = 0
 
-            assert offset + weight.nbytes <= self.bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-            )
+            assert offset + tensor_meta.chunk_size <= self.bucket_size
+            assert tensor_meta.name not in bucket_meta
 
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-            }
-            send_buf[offset : offset + weight.nbytes] = cp.asarray(weight.view(-1).view(torch.uint8))
-            offset += weight.nbytes
+            tensor_meta.offset = offset
+            bucket_meta[tensor_meta.name] = tensor_meta
+            send_buf[offset : offset + tensor_meta.chunk_size] = cp.asarray(chunk)
+            offset += tensor_meta.chunk_size
 
         # broadcast last bucket
         torch.cuda.synchronize()
@@ -283,6 +300,15 @@ class NCCLCheckpointEngine(CheckpointEngine):
 
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
+        """
+        async for name, weight in merge_weight_chunks(self._receive_weight_chunks(), self.bucket_size):
+            yield name, weight
+
+    async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        """Receive the weight chunks of the model.
+
+        Yields:
+            A tuple of the name of the weight tensor and the chunk itself.
         """
         assert self.rank > 0, "Rank 0 should not receive weights."
         send_buf, recv_buf = self.send_buf, self.recv_buf
@@ -316,11 +342,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             )
 
             # 2. yield tensor from send_buf
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
-                size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-                yield name, tensor
+            for name, tensor_meta in metadata["bucket_meta"].items():
+                tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+                yield tensor_meta, tensor
 
             # 3. wait for next bucket broadcast finish
             metadata = await broadcast_op.wait_for_complete()
@@ -332,11 +356,9 @@ class NCCLCheckpointEngine(CheckpointEngine):
             send_buf, recv_buf = recv_buf, send_buf
 
         # yield tensor from send_buf
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
-            size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-            yield name, tensor
+        for name, tensor_meta in metadata["bucket_meta"].items():
+            tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+            yield tensor_meta, tensor
 
         time_cost = time.time() - start_time
         bandwidth = total_bytes / time_cost / (1024 * 1024 * 1024)

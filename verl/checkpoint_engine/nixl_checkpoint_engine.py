@@ -19,8 +19,11 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import AsyncGenerator, Generator
+from unittest.mock import patch
 
-import cupy as cp
+with patch("importlib.metadata.distributions", return_value=[]):
+    import cupy as cp
+
 import nixl._api as nixl_api
 import nixl._bindings as nixl_bindings
 import ray
@@ -28,7 +31,13 @@ import torch
 import zmq
 import zmq.asyncio
 
-from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
+from verl.checkpoint_engine.base import (
+    CheckpointEngine,
+    CheckpointEngineRegistry,
+    TensorMeta,
+    merge_weight_chunks,
+    split_weight_chunks,
+)
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 
 logger = logging.getLogger(__name__)
@@ -79,7 +88,7 @@ class NixlAgent:
 
     def start_zmq_server(self):
         self.ip = ray.util.get_node_ip_address().strip("[]")
-        self.listen_port, self.listen_sock = get_free_port(self.ip)
+        self.listen_port, _ = get_free_port(self.ip)
 
         context = zmq.asyncio.Context()
         self.socket = context.socket(zmq.PULL)
@@ -245,11 +254,13 @@ class NIXLCheckpointEngine(CheckpointEngine):
         bucket_size: int,
         device: str = "cuda",
         rollout_dtype: torch.dtype = torch.bfloat16,
+        is_master: bool = False,
     ):
         self.bucket_size = bucket_size
         self.device = device
         self.rollout_dtype = rollout_dtype
         self.agent = NixlAgent()
+        self.is_master = is_master
 
     def prepare(self) -> NixlAgentMetadata:
         """Prepare send and recv bucket.
@@ -273,6 +284,25 @@ class NIXLCheckpointEngine(CheckpointEngine):
         self.recv_descs = self.agent.get_xfer_descs(self.recv_buf)
 
         return self.agent.get_agent_metadata()
+
+    @classmethod
+    def build_topology(cls, trainer_world_size: int, rollout_world_size: int, metadata: list[dict]):
+        trainer_kwargs = {
+            "method": ["init_process_group"] * trainer_world_size,
+            "rank": [0] + [-1] * (trainer_world_size - 1),
+            "world_size": [rollout_world_size + 1] * trainer_world_size,
+            "prev_agent_metadata": [None] * trainer_world_size,
+            "next_agent_metadata": [metadata[-rollout_world_size]] + [None] * (trainer_world_size - 1),
+        }
+
+        rollout_kwargs = {
+            "method": ["init_process_group"] * rollout_world_size,
+            "rank": list(range(1, rollout_world_size + 1)),
+            "world_size": [rollout_world_size + 1] * rollout_world_size,
+            "prev_agent_metadata": [metadata[0]] + metadata[-rollout_world_size:-1],
+            "next_agent_metadata": metadata[-rollout_world_size + 1 :] + [None],
+        }
+        return trainer_kwargs, rollout_kwargs
 
     def init_process_group(
         self, rank: int, world_size: int, prev_agent_metadata: NixlAgentMetadata, next_agent_metadata: NixlAgentMetadata
@@ -316,7 +346,7 @@ class NIXLCheckpointEngine(CheckpointEngine):
             f"prev_agent: {self.prev_agent}, next_agent: {self.next_agent}"
         )
 
-    def finish(self):
+    def finalize(self):
         """Cleanup communication with the previous and next agent, and deregister the memory."""
         if self.prev_agent:
             self.agent.remove_remote_agent(self.prev_agent)
@@ -360,12 +390,9 @@ class NIXLCheckpointEngine(CheckpointEngine):
         start_time = time.time()
         bucket_meta: dict[str, TensorMeta] = {}
         offset = 0
-        for name, weight in weights:
-            # model parameters are in fp32 full precision
-            weight = weight.to(self.rollout_dtype)
-
+        async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
-            if offset + weight.nbytes > self.bucket_size:
+            if offset + tensor_meta.chunk_size > self.bucket_size:
                 torch.cuda.synchronize()
 
                 # wait previous bucket to be received
@@ -386,18 +413,13 @@ class NIXLCheckpointEngine(CheckpointEngine):
                 bucket_meta = {}
                 offset = 0
 
-            assert offset + weight.nbytes <= self.bucket_size, (
-                f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-            )
+            assert offset + tensor_meta.chunk_size <= self.bucket_size
+            assert tensor_meta.name not in bucket_meta
 
-            bucket_meta[name] = {
-                "name": name,
-                "shape": weight.shape,
-                "dtype": weight.dtype,
-                "offset": offset,
-            }
-            send_buf[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
-            offset += weight.nbytes
+            tensor_meta.offset = offset
+            bucket_meta[tensor_meta.name] = tensor_meta
+            send_buf[offset : offset + tensor_meta.chunk_size].copy_(chunk, non_blocking=True)
+            offset += tensor_meta.chunk_size
 
         # send last bucket meta to next agent
         torch.cuda.synchronize()
@@ -416,6 +438,15 @@ class NIXLCheckpointEngine(CheckpointEngine):
 
         Yields:
             A tuple of the name of the weight tensor and the tensor itself.
+        """
+        async for name, weight in merge_weight_chunks(self._receive_weight_chunks(), self.bucket_size):
+            yield name, weight
+
+    async def _receive_weight_chunks(self) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:
+        """Receive the weight chunks of the model.
+
+        Yields:
+            A tuple of the chunk metadata and the chunk buffer view in send_buf.
         """
         assert self.prev_agent is not None, "Previous agent is not set."
         send_buf, recv_buf = self.send_buf, self.recv_buf
@@ -451,11 +482,9 @@ class NIXLCheckpointEngine(CheckpointEngine):
             read_op.begin_read()
 
             # 3. yield tensor from send_buf
-            for name, meta in metadata["bucket_meta"].items():
-                dtype, shape = meta["dtype"], meta["shape"]
-                size = dtype.itemsize * shape.numel()
-                tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-                yield name, tensor
+            for name, tensor_meta in metadata["bucket_meta"].items():
+                tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+                yield tensor_meta, tensor
 
             # 4. wait for next agent read complete and read from previous agent complete
             if readable_op is not None:
@@ -481,11 +510,9 @@ class NIXLCheckpointEngine(CheckpointEngine):
             )
 
         # yield tensor from send_buf
-        for name, meta in metadata["bucket_meta"].items():
-            dtype, shape = meta["dtype"], meta["shape"]
-            size = dtype.itemsize * shape.numel()
-            tensor = send_buf[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-            yield name, tensor
+        for name, tensor_meta in metadata["bucket_meta"].items():
+            tensor = send_buf[tensor_meta.offset : tensor_meta.offset + tensor_meta.chunk_size]
+            yield tensor_meta, tensor
 
         # wait for next agent read complete
         if readable_op is not None:
