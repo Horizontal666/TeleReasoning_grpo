@@ -804,10 +804,14 @@ class FSDPEngine(BaseEngine):
                     params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
             else:  # merge lora
                 with merged_lora_context(self.module, backup_adapters=True):
-                    params = self.module.state_dict()
+                    # keep_vars=True skips Parameter.detach(); torch>=2.10
+                    # rejects detach when a DTensor's local-shard storage is
+                    # on CPU (CPUOffloadPolicy) while the DTensor's logical
+                    # device is cuda. Downstream does explicit .to(device).
+                    params = self.module.state_dict(keep_vars=True)
                     params = normalize_peft_param_name(params)
         else:
-            params = self.module.state_dict()
+            params = self.module.state_dict(keep_vars=True)
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 

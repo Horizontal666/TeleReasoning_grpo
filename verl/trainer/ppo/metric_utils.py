@@ -265,6 +265,70 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # ------------------------------------------------------------------
+    # Per-data_source breakdown of training-step score / reward / length.
+    # Defaults to no-op if the batch isn't tagged with a data_source
+    # (legacy non-mixed runs). For mixed-source runs (telelogs + telemath
+    # + 3gpp + MCQs in one batch) this surfaces
+    # `critic/{domain}/score/mean` etc. into wandb so per-domain training-
+    # reward curves are visible without post-hoc rollout-dump parsing.
+    # ------------------------------------------------------------------
+    data_sources = batch.non_tensor_batch.get("data_source", None)
+    if data_sources is not None and len(data_sources) > 0:
+        import numpy as _np
+
+        ds_arr = _np.asarray(data_sources)
+        sequence_score_np = sequence_score.detach().cpu().numpy()
+        sequence_reward_np = sequence_reward.detach().cpu().numpy()
+        response_length_np = response_length.detach().cpu().numpy()
+
+        # Per-token advantages/returns -> per-sample summary by masking on
+        # response_mask and taking mean over valid response tokens.
+        if advantages.dim() == 2:
+            mask_cpu = response_mask.detach().cpu()
+            adv_per_sample = (
+                advantages.detach().cpu().float()
+                .masked_fill(~mask_cpu, float("nan"))
+                .nanmean(dim=-1)
+                .numpy()
+            )
+            ret_per_sample = (
+                returns.detach().cpu().float()
+                .masked_fill(~mask_cpu, float("nan"))
+                .nanmean(dim=-1)
+                .numpy()
+            )
+        else:
+            adv_per_sample = ret_per_sample = None
+
+        for domain in _np.unique(ds_arr):
+            domain_str = str(domain)
+            mask = ds_arr == domain
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            d_score = sequence_score_np[mask]
+            d_reward = sequence_reward_np[mask]
+            d_len = response_length_np[mask]
+            metrics[f"critic/{domain_str}/score/mean"] = float(d_score.mean())
+            metrics[f"critic/{domain_str}/score/max"] = float(d_score.max())
+            metrics[f"critic/{domain_str}/score/min"] = float(d_score.min())
+            metrics[f"critic/{domain_str}/rewards/mean"] = float(d_reward.mean())
+            metrics[f"critic/{domain_str}/rewards/max"] = float(d_reward.max())
+            metrics[f"critic/{domain_str}/rewards/min"] = float(d_reward.min())
+            metrics[f"critic/{domain_str}/count"] = n
+            metrics[f"response_length/{domain_str}/mean"] = float(d_len.mean())
+            metrics[f"response_length/{domain_str}/max"] = float(d_len.max())
+            if adv_per_sample is not None:
+                d_adv = adv_per_sample[mask]
+                d_ret = ret_per_sample[mask]
+                # All-NaN slices happen rarely (every sample in the domain
+                # had an empty response_mask); skip rather than emit NaN.
+                if _np.isfinite(d_adv).any():
+                    metrics[f"critic/{domain_str}/advantages/mean"] = float(_np.nanmean(d_adv))
+                if _np.isfinite(d_ret).any():
+                    metrics[f"critic/{domain_str}/returns/mean"] = float(_np.nanmean(d_ret))
+
     return metrics
 
 

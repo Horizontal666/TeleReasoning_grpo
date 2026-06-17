@@ -135,17 +135,19 @@ def _array_equal(array1: np.ndarray, array2: np.ndarray, visited: set[int]) -> b
     Returns:
         True if the arrays' dtypes, shapes, and all elements are equal.
     """
-    # Check dtype and shape first, as this is the fastest failure path.
-    if array1.dtype != array2.dtype or array1.shape != array2.shape:
+    # Check shape first, as this is the fastest failure path.
+    if array1.shape != array2.shape:
         return False
 
-    # For non-object dtypes, use NumPy's implementation with equal_nan=True.
-    if array1.dtype != "object":
+    # For plain numeric / string dtypes, rely on NumPy's elementwise equality.
+    # We intentionally do not require the dtypes to match exactly because
+    # serialization / IPC may round-trip non-tensor metadata through a different
+    # but value-equivalent dtype (for example object vs <U, int32 vs int64).
+    if array1.dtype != "object" and array2.dtype != "object":
         return np.array_equal(array1, array2, equal_nan=True)
 
-    # For object-dtype arrays, we must recursively compare each element.
-    # We delegate to _deep_equal to handle elements, as they could be any
-    # type, including other nested arrays or NaNs.
+    # If either side is object-dtype, recursively compare each element. This
+    # lets us handle mixed object / non-object string arrays and nested objects.
     return all(_deep_equal(x, y, visited) for x, y in zip(array1.flat, array2.flat, strict=False))
 
 
@@ -157,6 +159,13 @@ def _deep_equal(a: Any, b: Any, visited: set[int]) -> bool:
     - Dispatches to _array_equal if both objects are NumPy arrays.
     - Otherwise, uses standard '==' comparison.
     """
+    # Normalize NumPy scalar wrappers (for example np.str_, np.int64) to native
+    # Python scalars so object-dtype arrays can compare equal after serialization.
+    if isinstance(a, np.generic):
+        a = a.item()
+    if isinstance(b, np.generic):
+        b = b.item()
+
     if type(a) is not type(b):
         return False
 

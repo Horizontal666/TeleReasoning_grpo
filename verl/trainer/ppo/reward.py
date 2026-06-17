@@ -165,3 +165,21 @@ def extract_reward(batch: DataProto):
     reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
     reward_extra_infos_dict = {key: batch.non_tensor_batch[key] for key in reward_extra_keys}
     return reward_tensor, reward_extra_infos_dict
+
+
+def compute_reward(data, reward_fn):
+    """Legacy compute_reward, retained for recipe/dapo/dapo_ray_trainer.
+
+    The new RewardLoopManager path populates ``batch.batch['rm_scores']`` and
+    callers use :func:`extract_reward` afterwards. DAPO's custom ``fit()``
+    still calls the sync ``reward_fn(batch)`` directly to score generation
+    batches inline (it needs per-batch scoring to drive filter_groups), so
+    this thin shim is the compatibility bridge. ``reward_fn`` must be a
+    legacy reward manager (e.g. BatchRewardManager) whose ``__call__``
+    supports ``return_dict=True``.
+    """
+    result = reward_fn(data, return_dict=True)
+    if isinstance(result, dict):
+        return result["reward_tensor"], result.get("reward_extra_info", {})
+    # Older managers may return just the reward tensor.
+    return result, {}

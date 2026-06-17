@@ -236,12 +236,12 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                 if self.should_save_model:
                     model_state_dict = self.model.state_dict()
-                    torch.save(model_state_dict, model_path)
+                    torch.save(model_state_dict, model_path, _use_new_zipfile_serialization=False)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
                 if self.should_save_optimizer:
                     optimizer_state_dict = self.optimizer.state_dict()
-                    torch.save(optimizer_state_dict, optim_path)
+                    torch.save(optimizer_state_dict, optim_path, _use_new_zipfile_serialization=False)
                     log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)
 
                 if self.should_save_extra:
@@ -250,7 +250,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                         "lr_scheduler": lr_scheduler_state_dict,
                         "rng": self.get_rng_state(),
                     }
-                    torch.save(extra_state_dict, extra_path)
+                    torch.save(extra_state_dict, extra_path, _use_new_zipfile_serialization=False)
                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
 
         if self.rank == 0:

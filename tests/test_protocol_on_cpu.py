@@ -103,6 +103,16 @@ def test_union_numpy_dict():
     with pytest.raises(AssertionError):
         union_numpy_dict({"data": arr_4d_obj}, {"data": arr_4d_obj_diff})
 
+    # NumPy scalar wrappers may appear after serialization / IPC. These should
+    # compare equal to their native Python scalar counterparts.
+    py_scalar_arr = np.array(["TeleMath", 7, True], dtype=object)
+    np_scalar_arr = np.array([np.str_("TeleMath"), np.int64(7), np.bool_(True)], dtype=object)
+    union_numpy_dict({"data_source": py_scalar_arr}, {"data_source": np_scalar_arr})
+
+    # String metadata may also round-trip through a plain unicode dtype array.
+    unicode_arr = np.array(["TeleMath", "TeleMath"])
+    union_numpy_dict({"data_source": py_scalar_arr[:2]}, {"data_source": unicode_arr})
+
     # --- Test Case 4: Explicit NaN value comparison ---
     # This verifies that our new _deep_equal logic correctly handles NaNs.
     nan_arr = np.array([1.0, np.nan, 3.0])

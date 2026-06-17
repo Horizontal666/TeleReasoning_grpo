@@ -72,6 +72,9 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        forced_ray_temp_dir = os.environ.get("RAY_TMPDIR", "").strip()
+        if forced_ray_temp_dir:
+            ray_init_kwargs["_temp_dir"] = forced_ray_temp_dir
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
