@@ -51,7 +51,7 @@ PY
 }
 
 # Respect externally provided GPU selection and default to the 2-GPU symbolic recipe layout.
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,2}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES// /}"
 export CUDA_VISIBLE_DEVICES
 
@@ -67,27 +67,88 @@ export VLLM_ENABLE_SLEEP_MODE="${VLLM_ENABLE_SLEEP_MODE:-1}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 
 SHORT_RUNTIME_USER="${USER:-$(id -un)}"
-PROJECT_CACHE_ROOT="${PROJECT_CACHE_ROOT:-${REPO_ROOT}/.cache}"
-PROJECT_VOLATILE_CACHE_BASE="${PROJECT_VOLATILE_CACHE_BASE:-/tmp/${SHORT_RUNTIME_USER}/fr}"
-PROJECT_RUNTIME_SESSION_ID="${PROJECT_RUNTIME_SESSION_ID:-p$$}"
-export PROJECT_CACHE_ROOT PROJECT_VOLATILE_CACHE_BASE PROJECT_RUNTIME_SESSION_ID
+# Ignore inherited generic runtime-path variables from other launchers so this
+# script always gets a compact Ray temp root unless explicitly overridden via
+# launcher-specific env vars.
+unset PROJECT_CACHE_ENV_LOADED PROJECT_REPO_LAYOUT_LOADED
+unset PROJECT_LOCAL_RUNTIME_ROOT CACHE_ROOT RUNTIME_CACHE_ROOT
+unset TORCH_EXTENSIONS_DIR CUDA_CACHE_PATH
+unset VLLM_RUNTIME_CACHE_ROOT VLLM_TORCH_COMPILE_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR OUTLINES_CACHE_DIR
+unset RAY_TMPDIR RAY_AIR_LOCAL_CACHE_DIR
+unset TMPDIR TMP TEMP
+
+PROJECT_CACHE_ROOT="${FLOWRL_PROJECT_CACHE_ROOT:-${REPO_ROOT}/.cache}"
+PROJECT_VOLATILE_CACHE_BASE="${FLOWRL_PROJECT_VOLATILE_CACHE_BASE:-/tmp/${SHORT_RUNTIME_USER}/fr}"
+PROJECT_RUNTIME_SESSION_ID="${FLOWRL_PROJECT_RUNTIME_SESSION_ID:-$(date +%Y%m%d_%H%M%S)_pid$$}"
+PROJECT_LOCAL_RUNTIME_ROOT="${FLOWRL_PROJECT_LOCAL_RUNTIME_ROOT:-${PROJECT_VOLATILE_CACHE_BASE}/${PROJECT_RUNTIME_SESSION_ID}}"
+export PROJECT_CACHE_ROOT PROJECT_VOLATILE_CACHE_BASE PROJECT_RUNTIME_SESSION_ID PROJECT_LOCAL_RUNTIME_ROOT
+
+CACHE_HELPER_CANDIDATES=(
+    "${REPO_ROOT}/scripts/use_project_cache.sh"
+    "${REPO_ROOT}/TeleReasoning_Data/scripts/util/Telemath/self_generated/DataFlow/api_pipelines/Telemath_expand/project_scripts/use_project_cache.sh"
+)
+
+CACHE_HELPER_PATH=""
+for candidate in "${CACHE_HELPER_CANDIDATES[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+        CACHE_HELPER_PATH="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${CACHE_HELPER_PATH}" ]]; then
+    echo "Could not locate use_project_cache.sh from any known path." >&2
+    exit 1
+fi
 
 # shellcheck source=/dev/null
-. "${REPO_ROOT}/scripts/use_project_cache.sh"
+. "${CACHE_HELPER_PATH}"
+
+# Keep runtime/cache roots compact so Ray's AF_UNIX sockets stay under the
+# kernel pathname limit while using a fresh /tmp-backed runtime cache per run.
+RUNTIME_CACHE_ROOT="${PROJECT_LOCAL_RUNTIME_ROOT}/runtime"
+TORCH_EXTENSIONS_DIR="${RUNTIME_CACHE_ROOT}/torch_extensions"
+CUDA_CACHE_PATH="${RUNTIME_CACHE_ROOT}/cuda"
+VLLM_RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT}/vllm"
+VLLM_TORCH_COMPILE_CACHE_DIR="${VLLM_RUNTIME_CACHE_ROOT}/torch_compile_cache"
+TORCHINDUCTOR_CACHE_DIR="${VLLM_RUNTIME_CACHE_ROOT}/inductor_cache"
+TRITON_CACHE_DIR="${VLLM_RUNTIME_CACHE_ROOT}/triton_cache"
+OUTLINES_CACHE_DIR="${VLLM_RUNTIME_CACHE_ROOT}/outlines"
+RAY_TMPDIR="${PROJECT_LOCAL_RUNTIME_ROOT}/ray"
+RAY_AIR_LOCAL_CACHE_DIR="${PROJECT_LOCAL_RUNTIME_ROOT}/ray_air"
+TMPDIR="${PROJECT_LOCAL_RUNTIME_ROOT}/tmp"
+TMP="${TMPDIR}"
+TEMP="${TMPDIR}"
+export RUNTIME_CACHE_ROOT TORCH_EXTENSIONS_DIR CUDA_CACHE_PATH
+export VLLM_RUNTIME_CACHE_ROOT VLLM_TORCH_COMPILE_CACHE_DIR TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR OUTLINES_CACHE_DIR
+export RAY_TMPDIR RAY_AIR_LOCAL_CACHE_DIR TMPDIR TMP TEMP
+mkdir -p \
+    "${PROJECT_LOCAL_RUNTIME_ROOT}" \
+    "${RUNTIME_CACHE_ROOT}" \
+    "${TORCH_EXTENSIONS_DIR}" \
+    "${CUDA_CACHE_PATH}" \
+    "${VLLM_RUNTIME_CACHE_ROOT}" \
+    "${VLLM_TORCH_COMPILE_CACHE_DIR}" \
+    "${TORCHINDUCTOR_CACHE_DIR}" \
+    "${TRITON_CACHE_DIR}" \
+    "${OUTLINES_CACHE_DIR}" \
+    "${RAY_TMPDIR}" \
+    "${RAY_AIR_LOCAL_CACHE_DIR}" \
+    "${TMPDIR}"
 
 RESET_RUNTIME_COMPILE_CACHE="${RESET_RUNTIME_COMPILE_CACHE:-0}"
 export RESET_RUNTIME_COMPILE_CACHE
 export TIKTOKEN_ENCODINGS_BASE="${TIKTOKEN_ENCODINGS_BASE:-${TIKTOKEN_CACHE_DIR}}"
 
 DEFAULT_MODEL_CANDIDATES=(
-    "/home/shenyl/hf/model/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    "${REPO_ROOT}/model/DeepSeek-R1-Distill-Qwen-1.5B"
+    # "/home/shenyl/hf/model/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    # "${REPO_ROOT}/model/DeepSeek-R1-Distill-Qwen-1.5B"
+    # "/dpc/kuin0100/bohao/202509_InferenceModel/model/DeepSeek-R1-Distill-Qwen-1.5B"
+    # "${REPO_ROOT}/model/Qwen2.5-7B-Instruct"
+    # "/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen2.5-7B-Instruct"
+    # "${REPO_ROOT}/model/Qwen3-8B"
+    # "/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen3-8B"
     "/dpc/kuin0100/bohao/202509_InferenceModel/model/DeepSeek-R1-Distill-Qwen-1.5B"
-    "${REPO_ROOT}/model/Qwen2.5-7B-Instruct"
-    "/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen2.5-7B-Instruct"
-    "${REPO_ROOT}/model/Qwen3-8B"
-    "/dpc/kuin0100/bohao/202509_InferenceModel/model/Qwen3-8B"
-    "/dpc/kuin0100/bohao/202509_InferenceModel/model/DeepSeek-R1-Distill-Qwen-32B"
 )
 
 if [[ -z "${PRETRAINED_MODEL:-}" ]]; then
@@ -100,14 +161,11 @@ if [[ -z "${PRETRAINED_MODEL:-}" ]]; then
 fi
 
 TRAIN_FILE_CANDIDATES=(
-    "/home/lihaoyu/data/train_4_merged.parquet"
+    # "/home/lihaoyu/data/train_4_merged.parquet"
     "${REPO_ROOT}/data/GRPO/telemath_param_augment_deepseek_v1/train.parquet"
 )
 
 VAL_FILE_CANDIDATES=(
-    "${REPO_ROOT}/data/math500.parquet"
-    "${REPO_ROOT}/data/aime24.parquet"
-    "${REPO_ROOT}/data/aime25.parquet"
     "${REPO_ROOT}/data/GRPO/telemath_param_augment_deepseek_v1/test.parquet"
 )
 
@@ -212,12 +270,17 @@ N_NODES="${N_NODES:-1}"
 # dataset/model/project/W&B resolution from this launcher intact.
 TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-12000}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-128}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 TEST_FREQ="${TEST_FREQ:-5}"
+# Retain only the latest 2 checkpoints by default; older global_step_* folders
+# are cleaned up by verl after a new checkpoint finishes saving.
+MAX_CKPT_TO_KEEP="${MAX_CKPT_TO_KEEP:-2}"
+MAX_ACTOR_CKPT_TO_KEEP="${MAX_ACTOR_CKPT_TO_KEEP:-${MAX_CKPT_TO_KEEP}}"
+MAX_CRITIC_CKPT_TO_KEEP="${MAX_CRITIC_CKPT_TO_KEEP:-${MAX_CKPT_TO_KEEP}}"
 FILTER_OVERLONG_PROMPTS="${FILTER_OVERLONG_PROMPTS:-True}"
 TRUNCATION="${TRUNCATION:-error}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
@@ -230,10 +293,10 @@ WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-${TRAINER_PROJECT_NAME}}"
 TRAINER_LOGGERS="${TRAINER_LOGGERS:-['console','wandb']}"
 CUSTOM_REWARD_PATH="${CUSTOM_REWARD_PATH:-${SCRIPT_DIR}/custom_reward.py}"
-CUSTOM_REWARD_NAME="${CUSTOM_REWARD_NAME:-my_math_reward_fn_deepmath_boxed}"
+CUSTOM_REWARD_NAME="${CUSTOM_REWARD_NAME:-default_reward_function}"
 
 ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-256}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-128}"
 USE_KL_LOSS="${USE_KL_LOSS:-True}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
 ACTOR_USE_DYNAMIC_BSZ="${ACTOR_USE_DYNAMIC_BSZ:-True}"
@@ -442,6 +505,7 @@ echo "Using CHECKPOINT_DIR=${CHECKPOINT_DIR}"
 echo "Using ROLL_OUT_DIR=${ROLL_OUT_DIR}"
 echo "Using VAL_DATA_DIR=${VAL_DATA_DIR}"
 echo "Using CACHE_ROOT=${CACHE_ROOT}"
+echo "Using PROJECT_LOCAL_RUNTIME_ROOT=${PROJECT_LOCAL_RUNTIME_ROOT}"
 echo "Using RUNTIME_CACHE_ROOT=${RUNTIME_CACHE_ROOT}"
 echo "Using RAY_TMPDIR=${RAY_TMPDIR}"
 echo "Using reward_loop=${USE_REWARD_LOOP} rollout_n=${ROLLOUT_N} rollout_m(metadata_only)=${ROLLOUT_M}"
@@ -486,6 +550,9 @@ fi
     printf 'KL_LOSS_COEF=%s\n' "${KL_LOSS_COEF}"
     printf 'SAVE_FREQ=%s\n' "${SAVE_FREQ}"
     printf 'TEST_FREQ=%s\n' "${TEST_FREQ}"
+    printf 'MAX_CKPT_TO_KEEP=%s\n' "${MAX_CKPT_TO_KEEP}"
+    printf 'MAX_ACTOR_CKPT_TO_KEEP=%s\n' "${MAX_ACTOR_CKPT_TO_KEEP}"
+    printf 'MAX_CRITIC_CKPT_TO_KEEP=%s\n' "${MAX_CRITIC_CKPT_TO_KEEP}"
     printf 'TOTAL_TRAINING_STEPS=%s\n' "${TOTAL_TRAINING_STEPS}"
     printf 'CHECKPOINT_DIR=%s\n' "${CHECKPOINT_DIR}"
     printf 'ROLL_OUT_DIR=%s\n' "${ROLL_OUT_DIR}"
@@ -518,7 +585,10 @@ CMD=(
     "trainer.nnodes=${N_NODES}"
     "trainer.save_freq=${SAVE_FREQ}"
     "trainer.test_freq=${TEST_FREQ}"
+    "trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP}"
+    "trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP}"
     "trainer.total_epochs=${TOTAL_EPOCHS}"
+    "++ray_kwargs.ray_init._temp_dir=${RAY_TMPDIR}"
     "algorithm.use_kl_in_reward=False"
     "actor_rollout_ref.model.path=${PRETRAINED_MODEL}"
     "actor_rollout_ref.model.use_remove_padding=True"

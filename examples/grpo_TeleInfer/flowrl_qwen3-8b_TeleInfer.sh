@@ -27,10 +27,29 @@ export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 SHORT_RUNTIME_USER="${USER:-$(id -un)}"
 PROJECT_CACHE_ROOT="${PROJECT_CACHE_ROOT:-${REPO_ROOT}/.cache}"
 PROJECT_VOLATILE_CACHE_BASE="${PROJECT_VOLATILE_CACHE_BASE:-/tmp/${SHORT_RUNTIME_USER}/fr}"
-PROJECT_RUNTIME_SESSION_ID="${PROJECT_RUNTIME_SESSION_ID:-p$$}"
+PROJECT_RUNTIME_SESSION_ID="${PROJECT_RUNTIME_SESSION_ID:-$(date +%Y%m%d_%H%M%S)_pid$$}"
 export PROJECT_CACHE_ROOT PROJECT_VOLATILE_CACHE_BASE PROJECT_RUNTIME_SESSION_ID
+
+CACHE_HELPER_CANDIDATES=(
+    "${REPO_ROOT}/scripts/use_project_cache.sh"
+    "${REPO_ROOT}/TeleReasoning_Data/scripts/util/Telemath/self_generated/DataFlow/api_pipelines/Telemath_expand/project_scripts/use_project_cache.sh"
+)
+
+CACHE_HELPER_PATH=""
+for candidate in "${CACHE_HELPER_CANDIDATES[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+        CACHE_HELPER_PATH="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${CACHE_HELPER_PATH}" ]]; then
+    echo "Could not locate use_project_cache.sh from any known path." >&2
+    exit 1
+fi
+
 # shellcheck source=/dev/null
-. "${REPO_ROOT}/scripts/use_project_cache.sh"
+. "${CACHE_HELPER_PATH}"
 RESET_RUNTIME_COMPILE_CACHE="${RESET_RUNTIME_COMPILE_CACHE:-0}"
 export RESET_RUNTIME_COMPILE_CACHE
 
@@ -167,7 +186,8 @@ WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_BASE_URL="${WANDB_BASE_URL:-https://api.wandb.ai}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-}"
-WANDB_PROJECT="${WANDB_PROJECT:-${TRAINER_PROJECT_NAME}}"
+WANDB_PROJECT="${WANDB_PROJECT:-${TRAINER_PR
+OJECT_NAME}}"
 WANDB_NAME="${WANDB_NAME:-${EXPERIMENT_NAME}}"
 WANDB_DIR="${WANDB_DIR:-${REPO_ROOT}/outputs/wandb}"
 
