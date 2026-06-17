@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 # shellcheck source=/dev/null
-. "${PROJECT_ROOT}/scripts/use_project_cache.sh"
+. "${PROJECT_ROOT}/TeleReasoning_Data/scripts/util/Telemath/self_generated/DataFlow/api_pipelines/Telemath_expand/project_scripts/use_project_cache.sh"
 
 # Default model/out directory/dataset fallback to local assets.
 DEFAULT_MODEL="${PROJECT_ROOT}/model/deepseek-math-7b-instruct"

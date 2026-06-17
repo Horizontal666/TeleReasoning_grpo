@@ -10,7 +10,7 @@ fi
 
 REPO_ROOT="/dpc/kuin0100/bohao/202509_InferenceModel"
 # shellcheck source=/dev/null
-. "${REPO_ROOT}/scripts/use_project_cache.sh"
+. "${REPO_ROOT}/TeleReasoning_Data/scripts/util/Telemath/self_generated/DataFlow/api_pipelines/Telemath_expand/project_scripts/use_project_cache.sh"
 FLOWRL_SCRIPT="${REPO_ROOT}/Inference/verl/examples/grpo_TeleInfer/flowrl_qwen3-8b_TeleInfer.sh"
 ANALYZE_SCRIPT="${REPO_ROOT}/Inference/verl/examples/grpo_TeleInfer/analyze_rollout_groups.py"
 EVAL_SCRIPT="${REPO_ROOT}/TeleReasoning_Eval_git/old_vllmUnify/telemath_eval_vllm_mathverify.py"

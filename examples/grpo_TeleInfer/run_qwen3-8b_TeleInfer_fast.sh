@@ -50,7 +50,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 # shellcheck source=/dev/null
-. "${REPO_ROOT}/scripts/use_project_cache.sh"
+. "${REPO_ROOT}/TeleReasoning_Data/scripts/util/Telemath/self_generated/DataFlow/api_pipelines/Telemath_expand/project_scripts/use_project_cache.sh"
 
 set -x
 
